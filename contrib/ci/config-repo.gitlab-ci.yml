@@ -1,0 +1,79 @@
+# GitLab CI template for a DutyDesk config repository.
+# Copy it to .gitlab-ci.yml of the config repository and adapt the variables.
+#
+#   validate         every merge request and the protected branch
+#   lockssh-rules    protected branch: the proposed lockssh rules, as an
+#                    artifact a human reviews and validates in lox
+#   deploy-actions   protected branch: installs the action catalogue on the
+#                    action host
+#
+# The pipeline never changes a lock policy: it only publishes proposals.
+# CI/CD variables (protected; masked where secret):
+#   DUTYDESK_IMAGE        an image holding the dutydesk binary, rsync and ssh
+#   ACTION_HOST           user@host of the action host
+#   ACTION_HOST_KEY       file variable: SSH private key allowed to write the catalogue only
+#   ACTION_HOST_KNOWN     file variable: known_hosts line(s) of the action host
+#   ACTIONS_DIR           catalogue directory on the host (default /opt/dutydesk/actions)
+#   INSTALL_DIR           where dutydesk-act lives on the host (default /opt/dutydesk/bin)
+
+stages: [validate, propose, deploy]
+
+default:
+  image: $DUTYDESK_IMAGE
+
+variables:
+  ACTIONS_DIR: /opt/dutydesk/actions
+  INSTALL_DIR: /opt/dutydesk/bin
+
+validate:
+  stage: validate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - dutydesk config validate .
+    - |
+      for s in projects/*/actions/*/*.sh; do
+        [ -e "$s" ] || continue
+        [ -x "$s" ] || { echo "$s is not executable"; exit 1; }
+      done
+
+lockssh-rules:
+  stage: propose
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"
+  script:
+    - mkdir -p lockssh-rules
+    - |
+      for dir in projects/*/; do
+        p="$(basename "$dir")"
+        dutydesk config lockssh-rules --project "$p" --dir . --install-dir "$INSTALL_DIR" > "lockssh-rules/$p.toml"
+      done
+  artifacts:
+    name: lockssh-rules-$CI_COMMIT_SHORT_SHA
+    paths: [lockssh-rules/]
+    expire_in: 90 days
+
+deploy-actions:
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"
+  needs: [validate]
+  environment: action-host
+  script:
+    # One flat catalogue: <ACTIONS_DIR>/<action>/{action.yaml,script}. Action
+    # names must be unique across the projects that share an action host.
+    - mkdir -p catalogue
+    - |
+      for a in projects/*/actions/*/; do
+        [ -d "$a" ] || continue
+        name="$(basename "$a")"
+        [ ! -e "catalogue/$name" ] || { echo "action $name is defined by two projects"; exit 1; }
+        cp -r "$a" "catalogue/$name"
+      done
+    # The key is a file variable: it stays where the runner put it (mode 0600 required by ssh).
+    - chmod 0600 "$ACTION_HOST_KEY"
+    - >
+      rsync -rlpt --delete --chmod=D0755,Fgo-w
+      -e "ssh -i $ACTION_HOST_KEY -o UserKnownHostsFile=$ACTION_HOST_KNOWN -o StrictHostKeyChecking=yes"
+      catalogue/ "$ACTION_HOST:$ACTIONS_DIR/"

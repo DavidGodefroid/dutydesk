@@ -1,0 +1,60 @@
+{
+  "action": "resolved",
+  "installation": {
+    "uuid": "a8e5d37a-696c-4c54-adb5-b3f28d64c7de"
+  },
+  "data": {
+    "issue": {
+      "id": "4509877862",
+      "shortId": "SHOP-API-3F",
+      "title": "RenderException: Cannot render invoice for marie.durand@example.org",
+      "culprit": "App\\Service\\InvoiceRenderer::render",
+      "permalink": "https://sentry.io/organizations/acme/issues/4509877862/",
+      "logger": null,
+      "level": "error",
+      "status": "resolved",
+      "substatus": "new",
+      "platform": "php",
+      "project": {
+        "id": "4505321021",
+        "name": "Shop API PII-PROJECT-NAME",
+        "slug": "shop-api",
+        "platform": "php"
+      },
+      "type": "error",
+      "metadata": {
+        "value": "Cannot render invoice for marie.durand@example.org",
+        "type": "App\\Exception\\RenderException",
+        "filename": "src/Service/InvoiceRenderer.php",
+        "function": "render",
+        "display_title_with_tree_label": false
+      },
+      "numComments": 0,
+      "assignedTo": {
+        "type": "user",
+        "id": "12",
+        "name": "Jean Dupont",
+        "email": "jean.dupont@acme.example"
+      },
+      "isBookmarked": false,
+      "hasSeen": false,
+      "annotations": [],
+      "issueType": "error",
+      "issueCategory": "error",
+      "count": "12",
+      "userCount": 3,
+      "firstSeen": "2026-11-18T05:02:11.123000Z",
+      "lastSeen": "2026-11-18T05:58:40.456000Z",
+      "statusDetails": {
+        "inCommit": {
+          "message": "fix for marie.durand@example.org"
+        }
+      }
+    }
+  },
+  "actor": {
+    "type": "user",
+    "id": "12",
+    "name": "Jean Dupont PII-ACTOR"
+  }
+}

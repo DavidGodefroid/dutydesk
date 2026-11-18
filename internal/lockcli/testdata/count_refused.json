@@ -1,0 +1,19 @@
+{
+  "isError": true,
+  "content": [
+    {
+      "type": "text",
+      "text": "refused [E_PRODUCTION_HOST_AGENT]: this profile is production: a host agent is the non-production trial\nretry: ask_user"
+    },
+    {
+      "type": "text",
+      "text": "refusal: {\"code\":\"E_PRODUCTION_HOST_AGENT\",\"retry\":\"ask_user\"}"
+    }
+  ],
+  "structuredContent": {
+    "refusal": {
+      "code": "E_PRODUCTION_HOST_AGENT",
+      "retry": "ask_user"
+    }
+  }
+}

@@ -1,0 +1,16 @@
+name: skip-document
+description: Move one document of a job to the quarantine list so that the job can continue.
+level: auto
+script: skip-document.sh
+params:
+  - name: job-id
+    type: int
+    min: 1
+    max: 999999999999
+  - name: document-id
+    type: string
+    pattern: "^doc-[0-9a-f]{8,32}$"
+rate_limit:
+  count: 10
+  window: 1h
+timeout: 60s

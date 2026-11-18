@@ -1,0 +1,34 @@
+# Example project: "docflow", a system that processes documents with jobs.
+# Everything here is a placeholder: adapt hosts, paths and names.
+name: Docflow
+
+repos:
+  - name: app
+    forge: gitlab
+    url: https://gitlab.example.com/acme/docflow.git
+    project: acme/docflow
+    default_branch: main
+    token_file: /etc/dutydesk/secrets/gitlab-docflow.token   # service account: push branches, open MRs, never merge
+
+locks:
+  workspace: /srv/locks/docflow    # directory holding .lockfamily/ (served by lox live)
+  sql: docflow-db                  # locksql instance, read-only
+  log: docflow-logs                # locklog instance
+
+limits:                            # all optional; these are the defaults
+  max_open_per_check: 10           # above this, one "mass" incident and a human
+  max_runs_per_incident: 6
+  max_incident_age: 24h
+  run_timeout: 20m
+  max_turns: 60
+  max_parallel_runs: 2
+  green_light_timeout: 2h          # then the ticket is withdrawn and the incident escalated
+  queue_alert_after: 15m
+  recurrence_count: 3
+  recurrence_window: 168h
+  reminder_every: 24h
+
+alerts:
+  webhook_url_file: /etc/dutydesk/secrets/docflow-alerts.url   # outgoing webhook (Teams-compatible)
+
+seats: [seat-a, seat-b]            # empty = every seat of the daemon

@@ -1,0 +1,13 @@
+name: requeue-job
+description: Put a job that no longer progresses back in the queue; a worker resumes it from its last checkpoint.
+level: auto
+script: requeue-job.sh
+params:
+  - name: job-id
+    type: int
+    min: 1
+    max: 999999999999
+rate_limit:
+  count: 6
+  window: 1h
+timeout: 60s

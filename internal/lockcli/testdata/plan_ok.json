@@ -1,0 +1,11 @@
+{
+  "plan_id": "9f2c41d07ab35e68",
+  "profile": "prod",
+  "host": "db.internal:3306",
+  "db": "shop",
+  "sql": "SELECT id AS job_id, status, customer_email, started_at, retries FROM jobs WHERE status = 'running'",
+  "class": "read",
+  "verdict": "OK",
+  "summary": "read of shop.jobs",
+  "plan_hash": "sha256:5d41402abc4b2a76b9719d911017c592"
+}

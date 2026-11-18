@@ -1,0 +1,9 @@
+{
+  "columns": null,
+  "rows": null,
+  "truncated": false,
+  "status": "pending",
+  "ticket": "01JCQ8Z5T3M0V9K2R7XW4HN6PD",
+  "lock": "locksql",
+  "instance": "sql-prod"
+}

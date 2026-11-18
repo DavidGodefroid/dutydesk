@@ -1,0 +1,50 @@
+# DutyDesk agent image: one container per agent pass, destroyed at the end.
+# Build context: this directory.
+#   podman build -t dutydesk-agent:2.1.327 --build-arg CLAUDE_CODE_VERSION=2.1.327 -f Containerfile .
+ARG NODE_IMAGE=node:22-bookworm-slim
+FROM ${NODE_IMAGE}
+
+# Pinned Claude Code CLI version: an upgrade is a deliberate rebuild, never an
+# auto-update inside a pass (DISABLE_AUTOUPDATER=1 is set by the launcher).
+ARG CLAUDE_CODE_VERSION=2.1.327
+ARG AGENT_UID=10001
+ARG AGENT_GID=10001
+
+# git and CA certificates only. No curl, wget, ssh client or container client:
+# --no-install-recommends keeps openssh-client out (git only recommends it).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates git \
+ && rm -rf /var/lib/apt/lists/*
+
+# The CLI, then drop the package managers: nothing is installed at run time.
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+ && npm cache clean --force \
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+           /usr/local/bin/yarn /usr/local/bin/yarnpkg /opt/yarn-* /root/.npm
+
+# Fail the build if a forbidden client slipped in.
+RUN for b in curl wget ssh scp sftp docker podman nc ncat; do \
+      if command -v "$b" >/dev/null 2>&1; then echo "forbidden binary in image: $b" >&2; exit 1; fi; \
+    done \
+ && claude --version
+
+# Non-root user. The node base image already has uid 1000; the agent gets its own.
+RUN groupadd --gid "${AGENT_GID}" agent \
+ && useradd --uid "${AGENT_UID}" --gid "${AGENT_GID}" --home-dir /home/agent --create-home --shell /usr/sbin/nologin agent \
+ && mkdir -p /work/dossier /work/repos /work/config /etc/dutydesk \
+ && git config --system --add safe.directory '*'
+
+# Mount points (the root file system is read-only at run time; /tmp and
+# /home/agent are tmpfs):
+#   /work/dossier          incident dossier, read-only
+#   /work/repos/<name>     project clones, read-write
+#   /work/config           throwaway clone of the config repo, read-write
+#   /etc/dutydesk/mcp.json MCP configuration listing the lock clients, read-only
+ENV HOME=/home/agent \
+    DISABLE_AUTOUPDATER=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+USER agent
+WORKDIR /work
+ENTRYPOINT ["claude"]

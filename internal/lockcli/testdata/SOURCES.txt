@@ -1,0 +1,9 @@
+Samples of the lock clients' answers, shaped after the result types of the
+tagged sources (the docs describe the fields but print no full sample):
+
+- plan_ok.json, run_rows.json, run_pending.json: `locksql plan|run --json`
+  (locksql v0.20.0, internal/ipc PlanResult / RunResult; docs/usage.md §3, §4).
+- error_refused.json, error_no_console.json: the `{"error": ...}` object of a
+  failed `--json` command (internal/client ErrorInfo).
+- count_*.json: the `result` of an MCP `tools/call` of `locklog_count`
+  (locklog v0.4.1, internal/mcptools Out, internal/engine CountResult).

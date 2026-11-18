@@ -1,0 +1,32 @@
+{
+  "columns": [
+    "job_id",
+    "status",
+    "customer_email",
+    "started_at",
+    "retries",
+    "big",
+    "note"
+  ],
+  "rows": [
+    [
+      4812,
+      "running",
+      "<redacted>",
+      "2026-11-18T05:02:11Z",
+      3,
+      "9007199254740993",
+      null
+    ],
+    [
+      4813,
+      "running",
+      "<redacted>",
+      "2026-11-18T05:07:40Z",
+      0,
+      12.50,
+      "a<b & c"
+    ]
+  ],
+  "truncated": false
+}

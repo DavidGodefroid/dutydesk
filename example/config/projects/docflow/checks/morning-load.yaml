@@ -1,0 +1,14 @@
+# Expectation: the 06:00 load has started by 06:30. Signal when it is ABSENT.
+id: morning-load
+kind: expect
+source: sql
+schedule: "30 6 * * *"
+severity: high
+fingerprint: "morning-load-missing"
+summary: "The 06:00 load has not started today"
+query: |
+  SELECT id
+  FROM loads
+  WHERE kind = 'morning'
+    AND started_at >= CURRENT_DATE
+threshold: 1     # signal when fewer rows than this

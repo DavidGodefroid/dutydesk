@@ -1,0 +1,7 @@
+{
+  "error": {
+    "kind": "no_console",
+    "message": "no console is running for this profile",
+    "start": "lox run"
+  }
+}

@@ -1,0 +1,16 @@
+name: reset-job-status
+description: Rewrite the status of a job that is no longer running. Sensitive, a human decides.
+level: green-light
+script: reset-job-status.sh
+params:
+  - name: job-id
+    type: int
+    min: 1
+    max: 999999999999
+  - name: status
+    type: enum
+    enum: [queued, done, failed]
+rate_limit:
+  count: 3
+  window: 1h
+timeout: 60s

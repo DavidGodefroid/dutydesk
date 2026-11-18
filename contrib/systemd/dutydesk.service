@@ -1,0 +1,38 @@
+# DutyDesk daemon. Runs as its own user, never as the lox live user.
+# Adapt lox-live.service to the name of your lox live unit.
+[Unit]
+Description=DutyDesk incident manager
+Wants=network-online.target
+After=network-online.target lox-live.service
+# Start after lox live; DutyDesk itself waits until the locks serve.
+
+[Service]
+Type=simple
+User=dutydesk
+Group=dutydesk
+ExecStart=/usr/local/bin/dutydesk serve --config /etc/dutydesk/dutydesk.yaml
+Restart=on-failure
+RestartSec=5
+# Running passes are cancelled and requeued; give their containers time to be killed.
+TimeoutStopSec=60
+KillSignal=SIGTERM
+KillMode=mixed
+
+# Rootless podman needs the user's runtime directory (loginctl enable-linger dutydesk).
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+StateDirectory=dutydesk
+StateDirectoryMode=0750
+UMask=0027
+
+# Hardening that rootless containers tolerate. Do not add NoNewPrivileges,
+# PrivateUsers or a restrictive RestrictNamespaces: podman needs newuidmap
+# and user namespaces.
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

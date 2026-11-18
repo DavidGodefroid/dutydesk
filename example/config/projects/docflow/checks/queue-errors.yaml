@@ -1,0 +1,10 @@
+# Signal when the queue workers logged 20 errors or more in 15 minutes.
+id: queue-errors
+kind: log
+schedule: "*/10 * * * *"
+severity: medium
+fingerprint: "queue-errors"
+summary: "Queue workers logged many errors over the last 15 minutes"
+log_query: 'service:docflow-worker level:error'
+log_window: 15m
+threshold: 20

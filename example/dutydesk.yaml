@@ -1,0 +1,73 @@
+# dutydeskd's own configuration (example). Relative paths are taken from
+# this file's directory. No secret lives here: only paths to files that
+# the dutydeskd user alone can read.
+
+data_dir: /var/lib/dutydesk            # database, incident dossiers, clones
+
+# Local checkout of the config repository's protected branch. The daemon
+# loads configuration from here only, never from an agent's workspace.
+config_repo: ./config
+
+# Optional: let the core pull the checkout itself.
+config_remote:
+  url: https://gitlab.example.com/ops/dutydesk-config.git
+  branch: main
+  token_file: /etc/dutydesk/secrets/config-repo-token
+  forge: gitlab                        # gitlab | github: where configuration MRs are opened
+  # project: ops/dutydesk-config       # default: the URL path without ".git"
+
+listen: 127.0.0.1:8787                 # inbound webhooks, behind a reverse proxy
+
+runtime: podman                        # podman | docker
+agent_image: registry.example.com/ops/dutydesk-agent:1.0.0
+
+lox_status_socket: /run/lox-live/status.sock   # read-only status socket of lox live
+action_install_dir: /opt/dutydesk/bin          # where dutydesk-act lives on the action hosts
+
+seats:
+  - name: seat-a
+    token_file: /etc/dutydesk/secrets/seat-a.token
+    max_parallel: 2
+    expires_on: 2027-10-31
+  - name: seat-b
+    token_file: /etc/dutydesk/secrets/seat-b.token
+    max_parallel: 1
+
+max_parallel_runs: 3                   # across all projects
+# claude_model: ""                     # empty = the claude CLI's default
+
+heartbeat:
+  url: https://heartbeat.example.com/ping/dutydesk
+  every: 1m
+
+# The container of one agent pass (see docs/deployment.md).
+agent:
+  network: dutydesk-agents             # pre-created INTERNAL network; its only other member is the egress proxy
+  https_proxy: http://dutydesk-egress:3128   # proxy that only reaches api.anthropic.com:443
+  # no_proxy: ""
+  # Placeholders: {project} {runbook} {action_instance} {ask_instance} {incident}.
+  mcp_config: /etc/dutydesk/mcp/{project}/{runbook}.json   # declares the lock clients of this runbook, and only them
+  extra_mounts:
+    - /opt/lockfamily/bin:/opt/lockfamily/bin:ro           # lock client binaries
+    - /run/lox-live/clients/{project}:/run/locks:ro        # client sockets / launch material of the project's locks
+  user: "10001:10001"                  # the image's agent user
+  run_args:
+    - --userns=keep-id:uid=10001,gid=10001   # rootless podman: lets the agent write the mounted clones
+  memory: 4g
+  cpus: "2"
+  pids_limit: 512
+
+# How the core calls the lock clients for its checks. Omit the block to use
+# the launchers lox installs on the host. "{instance}" is the project's lock
+# instance; commands run with the project's locks.workspace as working directory.
+lock_clients:
+  sql_plan: [locksql, plan, --instance, "{instance}", --json, "-"]
+  sql_run: [locksql, run, --instance, "{instance}", --json, "{plan_id}"]
+  # locklog's host launcher refuses production profiles: on production, run
+  # the client in its own container with the socket volume mounted.
+  log_mcp: [podman, run, --rm, -i, --network, none, -e, LEA_AGENT, -e, LEA_AGENT_TOKEN,
+            -v, "/run/lox-live/clients/docflow:/run/locks:ro", "registry.example.com/ops/locklog-client:1.0.0",
+            mcp, --instance, "{instance}"]
+  env:
+    LOCKFAMILY_NO_COLOR: "1"
+  timeout: 30s

@@ -1,0 +1,11 @@
+{
+  "error": {
+    "kind": "refused",
+    "message": "placeholders are not supported",
+    "refusal": {
+      "code": "E_PLACEHOLDER",
+      "retry": "rewrite",
+      "hint": "write the literal value"
+    }
+  }
+}

@@ -1,0 +1,793 @@
+{
+  "action": "triggered",
+  "installation": {
+    "uuid": "a8e5d37a-696c-4c54-adb5-b3f28d64c7de"
+  },
+  "data": {
+    "event": {
+      "event_id": "e4874d664c3540c1a32eab185f12c5ab",
+      "project": 4505321021,
+      "release": "shop-api@2026.11.3",
+      "dist": null,
+      "platform": "php",
+      "message": "Cannot render invoice for marie.durand@example.org",
+      "title": "RenderException: Cannot render invoice for marie.durand@example.org",
+      "datetime": "2026-11-18T05:58:40.456000Z",
+      "timestamp": 1794981520.456,
+      "received": 1794981520.9,
+      "level": "error",
+      "logger": "",
+      "type": "error",
+      "culprit": "App\\Service\\InvoiceRenderer::render",
+      "location": "src/Service/InvoiceRenderer.php",
+      "metadata": {
+        "type": "App\\Exception\\RenderException",
+        "value": "Cannot render invoice for marie.durand@example.org",
+        "filename": "src/Service/InvoiceRenderer.php",
+        "function": "render"
+      },
+      "exception": {
+        "values": [
+          {
+            "type": "PDOException",
+            "value": "SQLSTATE[23000]: Duplicate entry 'paul.martin@example.net' for key 'email' PII-CHAINED",
+            "module": "",
+            "stacktrace": {
+              "frames": [
+                {
+                  "filename": "src/Repository/CustomerRepository.php",
+                  "function": "save",
+                  "lineno": 51,
+                  "vars": {
+                    "row": "PII-VAR paul.martin@example.net"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "type": "App\\Exception\\RenderException",
+            "value": "Cannot render invoice for marie.durand@example.org",
+            "mechanism": {
+              "type": "generic",
+              "handled": false
+            },
+            "stacktrace": {
+              "frames": [
+                {
+                  "filename": "vendor/framework/src/Pipeline0.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline0.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle0",
+                  "lineno": 100,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline1.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline1.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle1",
+                  "lineno": 101,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline2.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline2.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle2",
+                  "lineno": 102,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline3.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline3.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle3",
+                  "lineno": 103,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline4.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline4.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle4",
+                  "lineno": 104,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline5.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline5.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle5",
+                  "lineno": 105,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline6.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline6.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle6",
+                  "lineno": 106,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline7.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline7.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle7",
+                  "lineno": 107,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline8.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline8.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle8",
+                  "lineno": 108,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline9.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline9.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle9",
+                  "lineno": 109,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline10.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline10.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle10",
+                  "lineno": 110,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline11.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline11.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle11",
+                  "lineno": 111,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline12.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline12.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle12",
+                  "lineno": 112,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline13.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline13.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle13",
+                  "lineno": 113,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline14.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline14.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle14",
+                  "lineno": 114,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline15.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline15.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle15",
+                  "lineno": 115,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline16.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline16.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle16",
+                  "lineno": 116,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline17.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline17.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle17",
+                  "lineno": 117,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline18.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline18.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle18",
+                  "lineno": 118,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline19.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline19.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle19",
+                  "lineno": 119,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline20.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline20.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle20",
+                  "lineno": 120,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline21.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline21.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle21",
+                  "lineno": 121,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline22.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline22.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle22",
+                  "lineno": 122,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline23.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline23.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle23",
+                  "lineno": 123,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline24.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline24.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle24",
+                  "lineno": 124,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline25.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline25.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle25",
+                  "lineno": 125,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline26.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline26.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle26",
+                  "lineno": 126,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline27.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline27.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle27",
+                  "lineno": 127,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline28.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline28.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle28",
+                  "lineno": 128,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline29.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline29.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle29",
+                  "lineno": 129,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline30.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline30.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle30",
+                  "lineno": 130,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline31.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline31.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle31",
+                  "lineno": 131,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline32.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline32.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle32",
+                  "lineno": 132,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline33.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline33.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle33",
+                  "lineno": 133,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline34.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline34.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle34",
+                  "lineno": 134,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline35.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline35.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle35",
+                  "lineno": 135,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline36.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline36.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle36",
+                  "lineno": 136,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "vendor/framework/src/Pipeline37.php",
+                  "abs_path": "/home/jdupont/app/vendor/framework/src/Pipeline37.php",
+                  "module": "Framework\\Pipeline",
+                  "function": "handle37",
+                  "lineno": 137,
+                  "in_app": false,
+                  "context_line": "$mailer->send('marie.durand@example.org');",
+                  "pre_context": [
+                    "// PII-CONTEXT secret line"
+                  ],
+                  "vars": {
+                    "email": "marie.durand@example.org",
+                    "password": "PII-VAR-hunter2"
+                  }
+                },
+                {
+                  "filename": "src/Service/InvoiceRenderer.php",
+                  "abs_path": "/home/jdupont/app/src/Service/InvoiceRenderer.php",
+                  "module": "App\\Service\\InvoiceRenderer",
+                  "function": "App\\Service\\InvoiceRenderer::render",
+                  "lineno": 212,
+                  "in_app": true,
+                  "context_line": "throw new RenderException('Cannot render invoice for marie.durand@example.org');",
+                  "vars": {
+                    "customer": "PII-VAR Marie Durand",
+                    "iban": "BE68539007547034"
+                  }
+                },
+                {
+                  "module": "App\\Pdf\\Engine",
+                  "function": "App\\Pdf\\Engine::write",
+                  "lineno": "88",
+                  "in_app": true
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "request": {
+        "url": "https://shop.example/api/invoices/4812/pdf?token=PII-REQUEST-TOKEN",
+        "method": "POST",
+        "data": {
+          "customer_email": "marie.durand@example.org",
+          "card": "4111111111111111"
+        },
+        "headers": [
+          [
+            "Authorization",
+            "Bearer PII-REQUEST-BEARER"
+          ],
+          [
+            "Cookie",
+            "session=PII-REQUEST-COOKIE"
+          ],
+          [
+            "User-Agent",
+            "Mozilla/5.0"
+          ]
+        ],
+        "env": {
+          "REMOTE_ADDR": "203.0.113.77"
+        }
+      },
+      "user": {
+        "id": "88123",
+        "email": "marie.durand@example.org",
+        "username": "mdurand",
+        "ip_address": "203.0.113.77",
+        "name": "Marie Durand",
+        "geo": {
+          "city": "Namur",
+          "country_code": "BE"
+        }
+      },
+      "tags": [
+        [
+          "customer",
+          "PII-TAG acme-88123"
+        ],
+        [
+          "environment",
+          "production"
+        ],
+        [
+          "user",
+          "email:marie.durand@example.org"
+        ],
+        [
+          "url",
+          "https://shop.example/api/invoices/4812/pdf"
+        ]
+      ],
+      "contexts": {
+        "browser": {
+          "name": "Firefox",
+          "version": "131"
+        },
+        "device": {
+          "name": "PII-CONTEXT-DEVICE Marie's iPhone"
+        },
+        "trace": {
+          "trace_id": "0af7651916cd43dd8448eb211c80319c"
+        }
+      },
+      "breadcrumbs": {
+        "values": [
+          {
+            "category": "query",
+            "message": "SELECT * FROM customers WHERE email = 'marie.durand@example.org' PII-BREADCRUMB",
+            "timestamp": 1794981519.1
+          },
+          {
+            "category": "http",
+            "data": {
+              "url": "https://api.partner.example/v1/customers/88123?key=PII-BREADCRUMB-KEY"
+            }
+          }
+        ]
+      },
+      "extra": {
+        "invoice_payload": "PII-EXTRA Marie Durand, Rue de Fer 12, 5000 Namur"
+      },
+      "sdk": {
+        "name": "sentry.php",
+        "version": "4.10.0"
+      },
+      "url": "https://sentry.io/api/0/projects/acme/shop-api/events/e4874d664c3540c1a32eab185f12c5ab/",
+      "web_url": "https://sentry.io/organizations/acme/issues/4509877862/events/e4874d664c3540c1a32eab185f12c5ab/",
+      "issue_url": "https://sentry.io/api/0/issues/4509877862/",
+      "issue_id": "4509877862"
+    },
+    "triggered_rule": "PII-RULE Page Jean Dupont on invoice errors",
+    "issue_alert": {
+      "title": "PII-RULE Page Jean Dupont on invoice errors",
+      "settings": []
+    }
+  },
+  "actor": {
+    "type": "application",
+    "id": "sentry",
+    "name": "Sentry"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "alert": {
+    "id": "al-20931",
+    "rule": "queue-depth",
+    "status": "firing",
+    "value": 1842,
+    "critical": true,
+    "labels": {
+      "queue": "invoices",
+      "host": "mq-2"
+    },
+    "targets": [
+      {
+        "name": "worker-a"
+      },
+      {
+        "name": "worker-b"
+      }
+    ],
+    "annotations": {
+      "description": "Last message from marie.durand@example.org PII-GENERIC",
+      "runbook": "https://wiki.example/PII-GENERIC-URL"
+    }
+  },
+  "contact": {
+    "email": "oncall-jean.dupont@acme.example",
+    "phone": "+32470000000"
+  },
+  "sample": {
+    "body": "PII-GENERIC Marie Durand ordered 3 books"
+  }
+}

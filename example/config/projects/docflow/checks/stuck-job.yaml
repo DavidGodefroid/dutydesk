@@ -1,0 +1,14 @@
+# One signal per job that has been running for more than 30 minutes.
+id: stuck-job
+kind: sql
+schedule: "*/5 * * * *"
+severity: high
+fingerprint: "stuck-job:{job_id}"
+summary: "Job {job_id} ({job_kind}) has been running since {started_at}"
+query: |
+  SELECT id AS job_id, kind AS job_kind, started_at
+  FROM jobs
+  WHERE status = 'running'
+    AND started_at < NOW() - INTERVAL '30 minutes'
+  ORDER BY started_at
+  LIMIT 50
