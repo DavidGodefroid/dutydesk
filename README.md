@@ -6,6 +6,11 @@ agent per incident pass), unblocks (validated actions only) and, when the
 cause is in the code, proposes the fix as a merge request it never merges.
 Humans are alerted only for what it cannot solve alone.
 
+> **Status: experimental (v0.1.0).** Covered by tests with a scripted agent,
+> fake locks and a fake forge; not yet run on a real host. It needs the Lock
+> Family served unattended by `lox live`, which is not released yet. See
+> [CHANGELOG.md](CHANGELOG.md) and `docs/deployment.md` §9.
+
 DutyDesk is a **service**, not an agent: while everything is fine it spends
 no token. Every access to production goes through the Lock Family (masking
 and query control happen there, outside DutyDesk).
@@ -91,3 +96,7 @@ make image   # agent container image
 The end-to-end suite (`internal/core/e2e_test.go`) runs the whole service
 with a scripted agent, fake locks, a local bare git repository and a fake
 GitLab API: no Claude, no production.
+
+## License
+
+Apache 2.0, see [LICENSE](LICENSE).
