@@ -1,0 +1,50 @@
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+      - name: test
+        run: CGO_ENABLED=1 go test -race -count=1 ./...
+      - name: build archives
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            dir="dutydesk_${version}_linux_${arch}"
+            mkdir -p "dist/$dir"
+            for cmd in dutydesk dutydesk-act; do
+              GOOS=linux GOARCH="$arch" go build -trimpath \
+                -ldflags "-s -w -X main.version=${version}" \
+                -o "dist/$dir/$cmd" "./cmd/$cmd"
+            done
+            cp LICENSE README.md CHANGELOG.md "dist/$dir/"
+            cp -r contrib example docs agent "dist/$dir/"
+            tar -C dist -czf "dist/$dir.tar.gz" "$dir"
+            rm -r "dist/$dir"
+          done
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - name: release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '$0 ~ "^## \\[?"v {on=1; next} on && /^## / {exit} on' CHANGELOG.md > notes.md
+          test -s notes.md
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
