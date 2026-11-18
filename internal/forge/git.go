@@ -35,6 +35,7 @@ type gitCmd struct {
 	workTree string // GIT_WORK_TREE
 	auth     *gitAuth
 	env      []string // extra variables
+	stdin    []byte   // standard input, nil = none
 	maxOut   int      // stdout cap in bytes, 0 = 32 MiB
 }
 
@@ -141,6 +142,9 @@ func (f *Forge) git(ctx context.Context, c gitCmd, args ...string) (gitResult, e
 	stdout := &capBuffer{max: max}
 	stderr := &capBuffer{max: 2048}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
+	if c.stdin != nil {
+		cmd.Stdin = bytes.NewReader(c.stdin)
+	}
 	err := cmd.Run()
 	res := gitResult{out: stdout.buf.Bytes(), truncated: stdout.truncated}
 	if err != nil {

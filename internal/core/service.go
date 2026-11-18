@@ -44,6 +44,7 @@ type Periods struct {
 	ConfigSync    time.Duration // git fetch of the config repository (1m)
 	Reminders     time.Duration // reminders, seat expiry, capacity (1m)
 	RecheckRetry  time.Duration // wait before replaying a check that failed (1m)
+	Retention     time.Duration // pruning of old resolved incidents (1h)
 }
 
 func (p Periods) withDefaults() Periods {
@@ -59,6 +60,7 @@ func (p Periods) withDefaults() Periods {
 	def(&p.ConfigSync, time.Minute)
 	def(&p.Reminders, time.Minute)
 	def(&p.RecheckRetry, time.Minute)
+	def(&p.Retention, time.Hour)
 	return p
 }
 
@@ -95,9 +97,27 @@ type Options struct {
 	// Scheduler knobs, for tests.
 	NewCron     func() check.Cron
 	CheckJitter time.Duration
-	// EffectTimeout bounds the side effects of one pass (push, merge
-	// request, alerts); default 5 minutes.
+	// EffectTimeout bounds one attempt at the merge requests of a pass
+	// (push, forge API); default 5 minutes. Alerts have their own timeout.
 	EffectTimeout time.Duration
+	// AlertTimeout bounds the delivery of one alert; default 1 minute.
+	AlertTimeout time.Duration
+	// OutboxBackoff is the wait before each retry of an owed effect that
+	// failed (the last value repeats); default 15s, 1m, 5m, 15m.
+	OutboxBackoff []time.Duration
+	// ReplayWorkers bounds the check replays that run at once (default 4).
+	ReplayWorkers int
+	// LeftoverRetry is the pause between two attempts to remove an agent
+	// container that survived its pass (default 30s).
+	LeftoverRetry time.Duration
+}
+
+// pass is one running agent pass.
+type pass struct {
+	cancel    context.CancelFunc
+	container string      // name of the agent container
+	ended     atomic.Bool // the launcher returned
+	reaped    bool        // cancelled because the incident left investigating
 }
 
 // Service is the daemon. Build it with New, then call Run.
@@ -121,14 +141,20 @@ type Service struct {
 
 	mu         sync.Mutex
 	runCtx     context.Context
-	passes     map[string]context.CancelFunc // running passes, by incident id
-	passTokens map[string]string             // agent tokens of the incidents being worked on
+	passes     map[string]*pass  // running passes, by incident id
+	passTokens map[string]string // agent tokens of the incidents being worked on
 	perProject map[string]int
 	gate       map[string]*gateState // by lock workspace
 	lastDuty   map[string]time.Time
 	retryAt    map[string]time.Time // incident id -> next replay of its check
 	onceAlerts map[string]time.Time // de-duplication of system alerts
 	badConfig  string               // remote revision already rejected
+	inflight   map[string]bool      // background duties running, by key
+	seatsOut   bool                 // the "every seat is exhausted" alert was sent for this episode
+
+	replaySem chan struct{} // bounded pool of check replays
+	ioSem     chan struct{} // bounded pool of the other slow duties (lock status, forge, git)
+	outKick   map[string]chan struct{}
 
 	wg         sync.WaitGroup
 	kick       chan struct{}
@@ -165,11 +191,25 @@ func New(o Options) (*Service, error) {
 	if o.EffectTimeout <= 0 {
 		o.EffectTimeout = 5 * time.Minute
 	}
+	if o.AlertTimeout <= 0 {
+		o.AlertTimeout = time.Minute
+	}
+	if len(o.OutboxBackoff) == 0 {
+		o.OutboxBackoff = []time.Duration{15 * time.Second, time.Minute, 5 * time.Minute, 15 * time.Minute}
+	}
+	if o.ReplayWorkers <= 0 {
+		o.ReplayWorkers = 4
+	}
+	if o.LeftoverRetry <= 0 {
+		o.LeftoverRetry = 30 * time.Second
+	}
 	s := &Service{
 		o: o, d: o.Daemon, log: o.Logger, now: o.Now, periods: o.Periods.withDefaults(),
-		passes: map[string]context.CancelFunc{}, passTokens: map[string]string{}, perProject: map[string]int{}, gate: map[string]*gateState{},
+		passes: map[string]*pass{}, passTokens: map[string]string{}, perProject: map[string]int{}, gate: map[string]*gateState{},
 		lastDuty: map[string]time.Time{}, retryAt: map[string]time.Time{}, onceAlerts: map[string]time.Time{},
-		kick: make(chan struct{}, 1),
+		kick: make(chan struct{}, 1), inflight: map[string]bool{},
+		replaySem: make(chan struct{}, o.ReplayWorkers), ioSem: make(chan struct{}, 4),
+		outKick: map[string]chan struct{}{store.EffectAlert: make(chan struct{}, 1), store.EffectTransition: make(chan struct{}, 1)},
 	}
 	if err := os.MkdirAll(s.d.DataDir, 0o750); err != nil {
 		return nil, fmt.Errorf("core: data dir: %w", err)
@@ -189,7 +229,7 @@ func New(o Options) (*Service, error) {
 		st.Close()
 		return nil, err
 	}
-	if s.pool, err = seat.New(s.d.Seats, SeatState{st}, seat.WithClock(s.now)); err != nil {
+	if s.pool, err = seat.New(s.d.Seats, SeatState{st}, seat.WithClock(s.now), seat.WithMaxExhaustion(s.d.QuotaCap)); err != nil {
 		return fail(err)
 	}
 	s.dossier = incident.NewDossier(s.d.DataDir)
@@ -198,7 +238,7 @@ func New(o Options) (*Service, error) {
 	s.forge = o.Forge
 	if s.forge == nil {
 		fc := o.ForgeConfig
-		fc.PolicyFor = configPolicy
+		fc.PolicyFor = proposalPolicy
 		fc.Secrets = s.Secrets
 		if fc.Logf == nil {
 			fc.Logf = func(format string, args ...any) { s.log.Warn(s.scrub(fmt.Sprintf(format, args...))) }
@@ -277,8 +317,20 @@ func (s *Service) Run(ctx context.Context) error {
 		s.log.Info("recovered interrupted incidents", "count", len(recovered))
 	}
 	s.removeLeftoverContainers(ctx)
+	s.sweepWorkDirs()
 
 	var bg sync.WaitGroup
+	// The outbox is drained from the first moment: what a previous run owed
+	// (alerts, merge requests) goes out before anything new.
+	for kind, handle := range map[string]func(context.Context, store.Effect){
+		store.EffectAlert: s.deliverAlert, store.EffectTransition: s.runEffect,
+	} {
+		bg.Add(1)
+		go func() {
+			defer bg.Done()
+			s.drain(ctx, kind, handle)
+		}()
+	}
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
@@ -337,11 +389,16 @@ func (s *Service) turn(ctx context.Context) {
 	}
 	s.lastLoopOK.Store(time.Now().UnixNano())
 
+	// Nothing below waits on a lock, the forge, git or a webhook: every
+	// slow call runs in a bounded background pool (background) or in the
+	// outbox drain, so the loop keeps turning and the heartbeat stays
+	// truthful whatever a slow lock does.
+	s.reapPasses(ctx)
 	if s.due("health", s.periods.Health) {
 		s.pollLocks(ctx)
 	}
 	if s.syncer != nil && s.due("config", s.periods.ConfigSync) {
-		s.syncConfig(ctx)
+		s.background(ctx, s.ioSem, "config", s.syncConfig)
 	}
 	s.rechecks(ctx)
 	if s.due("tickets", s.periods.Tickets) {
@@ -351,13 +408,53 @@ func (s *Service) turn(ctx context.Context) {
 		s.clearedConditions(ctx)
 	}
 	if s.due("known", s.periods.KnownProblems) {
-		s.knownProblems(ctx)
+		s.background(ctx, s.ioSem, "known", s.knownProblems)
 	}
 	if s.due("reminders", s.periods.Reminders) {
-		s.reminders(ctx)
-		s.seatExpiry(ctx)
+		s.ageLimits()
+		s.reminders()
+		s.seatExpiry()
+		s.seatsExhausted()
+	}
+	if s.due("retention", s.periods.Retention) {
+		s.background(ctx, s.ioSem, "retention", func(context.Context) { s.retention() })
 	}
 	s.dispatch(ctx)
+}
+
+// background runs a slow duty outside the main loop, in the bounded pool
+// sem. A duty that is still running under the same key, or a full pool,
+// makes it a no-op: the next turn tries again. It reports whether the duty
+// was started.
+func (s *Service) background(ctx context.Context, sem chan struct{}, key string, fn func(context.Context)) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	s.mu.Lock()
+	if s.inflight[key] {
+		s.mu.Unlock()
+		return false
+	}
+	select {
+	case sem <- struct{}{}:
+	default:
+		s.mu.Unlock()
+		return false
+	}
+	s.inflight[key] = true
+	s.wg.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer func() {
+			<-sem
+			s.mu.Lock()
+			delete(s.inflight, key)
+			s.mu.Unlock()
+			s.wg.Done()
+		}()
+		fn(ctx)
+	}()
+	return true
 }
 
 // due reports whether a duty's period has elapsed on the service clock, and
@@ -433,6 +530,8 @@ func (t SeatTokens) Token(name string) (string, error) {
 }
 
 // journal appends to the dossier journal; a failure is logged, never fatal.
+// body is text the core wrote: untrusted text inside it goes through
+// incident.Quote first.
 func (s *Service) journal(id, title, body string) {
 	if err := s.dossier.Append(id, s.now(), title, s.scrub(body)); err != nil {
 		s.log.Error("journal not written", "incident", id, "error", err)

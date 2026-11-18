@@ -107,7 +107,7 @@ func (e *env) inState(fp string, state model.IncidentState) model.Incident {
 	case model.StateResolved:
 		v = model.Verdict{Outcome: model.OutcomeResolved}
 	}
-	tr, err := e.m.ApplyVerdict(inc, v, model.Runbook{}, model.Limits{})
+	tr, err := e.m.ApplyVerdict(inc, v, askRB, model.Limits{})
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -331,8 +331,18 @@ func TestRecurrence(t *testing.T) {
 			e.m.Close(o.Incident.ID, "")
 			e.clk.Add(t0.Sub(e.clk.Now()))
 			res := e.ingest(sig("stuck-job:new"), tc.limits)
-			if res.Kind != IngestCreated || res.Incident.Recurrent != tc.want {
+			// The family used up its pass budget: the incident goes straight
+			// to a human, with an alert owed and no agent pass.
+			wantKind, wantState, wantAlert := IngestCreated, model.StateQueued, model.AlertKind("")
+			if tc.want {
+				wantKind, wantState, wantAlert = IngestRecurrent, model.StateEscalated, model.AlertEscalated
+			}
+			if res.Kind != wantKind || res.Incident.Recurrent != tc.want || res.Incident.State != wantState || res.Alert != wantAlert {
 				t.Fatalf("recurrent = %v, want %v (%+v)", res.Incident.Recurrent, tc.want, res)
+			}
+			owed, _ := e.st.PendingEffects(store.EffectTransition)
+			if (len(owed) == 1) != tc.want {
+				t.Fatalf("owed effects = %+v", owed)
 			}
 		})
 	}
@@ -410,6 +420,7 @@ func TestApplyVerdict(t *testing.T) {
 			}
 			e.st.IncrementFailures(inc.ID)
 			e.clk.Add(tc.age)
+			tc.rb.AskInstance = "ssh-prod"
 			tr, err := e.m.ApplyVerdict(inc, tc.v, tc.rb, tc.limits)
 			if err != nil {
 				t.Fatal(err)
@@ -462,7 +473,7 @@ func TestApplyVerdict(t *testing.T) {
 			}
 			e := newEnv(t)
 			inc := e.inState("stuck-job:1", state)
-			if _, err := e.m.ApplyVerdict(inc, model.Verdict{Outcome: model.OutcomeResolved}, model.Runbook{}, model.Limits{}); !errors.Is(err, store.ErrStateConflict) {
+			if _, err := e.m.ApplyVerdict(inc, model.Verdict{Outcome: model.OutcomeResolved}, askRB, model.Limits{}); !errors.Is(err, store.ErrStateConflict) {
 				t.Fatalf("%s: err = %v", state, err)
 			}
 			if got := e.get(inc.ID); got.State != state || got.Runs != inc.Runs {
@@ -504,7 +515,7 @@ func TestRunFailed(t *testing.T) {
 			}
 			e.st.UpdateIncident(inc.ID, nil, func(i *model.Incident) error { i.Runs = tc.priorRuns; return nil })
 			e.clk.Add(tc.age)
-			tr, err := e.m.RunFailed(inc, tc.status, lim)
+			tr, err := e.m.RunFailed(inc, tc.status, model.Runbook{}, lim, "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -522,32 +533,32 @@ func TestRunFailed(t *testing.T) {
 	t.Run("a valid verdict between two failures restarts the retry", func(t *testing.T) {
 		e := newEnv(t)
 		inc := e.investigating("stuck-job:1")
-		if tr, _ := e.m.RunFailed(inc, model.RunFailed, model.Limits{}); tr.To != model.StateQueued {
+		if tr, _ := e.m.RunFailed(inc, model.RunFailed, model.Runbook{}, model.Limits{}, ""); tr.To != model.StateQueued {
 			t.Fatalf("first failure: %s", tr.To)
 		}
 		e.st.ClaimIncident(inc.ID)
-		if tr, _ := e.m.ApplyVerdict(inc, model.Verdict{Outcome: model.OutcomeRecheck}, model.Runbook{}, model.Limits{}); tr.To != model.StateWaiting {
+		if tr, _ := e.m.ApplyVerdict(inc, model.Verdict{Outcome: model.OutcomeRecheck}, askRB, model.Limits{}); tr.To != model.StateWaiting {
 			t.Fatalf("verdict: %s", tr.To)
 		}
 		e.m.Recheck(inc, true)
 		e.st.ClaimIncident(inc.ID)
-		if tr, _ := e.m.RunFailed(inc, model.RunTimeout, model.Limits{}); tr.To != model.StateQueued {
+		if tr, _ := e.m.RunFailed(inc, model.RunTimeout, model.Runbook{}, model.Limits{}, ""); tr.To != model.StateQueued {
 			t.Fatalf("failure after a verdict: %s", tr.To)
 		}
 		e.st.ClaimIncident(inc.ID)
-		if tr, _ := e.m.RunFailed(inc, model.RunFailed, model.Limits{}); tr.To != model.StateEscalated {
+		if tr, _ := e.m.RunFailed(inc, model.RunFailed, model.Runbook{}, model.Limits{}, ""); tr.To != model.StateEscalated {
 			t.Fatalf("second consecutive failure: %s", tr.To)
 		}
 	})
 	t.Run("wrong status or state", func(t *testing.T) {
 		e := newEnv(t)
 		inc := e.investigating("stuck-job:1")
-		if _, err := e.m.RunFailed(inc, model.RunOK, model.Limits{}); err == nil {
+		if _, err := e.m.RunFailed(inc, model.RunOK, model.Runbook{}, model.Limits{}, ""); err == nil {
 			t.Fatal("RunOK accepted")
 		}
 		q := e.inState("stuck-job:2", model.StateQueued)
 		for _, st := range []model.RunStatus{model.RunFailed, model.RunQuota} {
-			if _, err := e.m.RunFailed(q, st, model.Limits{}); !errors.Is(err, store.ErrStateConflict) {
+			if _, err := e.m.RunFailed(q, st, model.Runbook{}, model.Limits{}, ""); !errors.Is(err, store.ErrStateConflict) {
 				t.Fatalf("%s on a queued incident: %v", st, err)
 			}
 		}
@@ -622,7 +633,7 @@ func TestGreenLight(t *testing.T) {
 		keep   bool // ticket stays on the incident
 	}{
 		{model.TicketApproved, model.StateQueued, "", true},
-		{model.TicketConsumed, model.StateQueued, "", true},
+		{model.TicketConsumed, model.StateEscalated, model.AlertEscalated, false},
 		{model.TicketDenied, model.StateEscalated, model.AlertEscalated, false},
 		{model.TicketExpired, model.StateEscalated, model.AlertEscalated, false},
 		{model.TicketWithdrawn, model.StateEscalated, model.AlertEscalated, false},
@@ -663,7 +674,7 @@ func TestGreenLight(t *testing.T) {
 		if err != nil || next == nil || next.ID != inc.ID || next.Ticket != "ssh-prod/42" || next.AgentToken != inc.AgentToken {
 			t.Fatalf("next = %+v, %v", next, err)
 		}
-		tr, _ := e.m.ApplyVerdict(*next, model.Verdict{Outcome: model.OutcomeResolved}, model.Runbook{}, model.Limits{})
+		tr, _ := e.m.ApplyVerdict(*next, model.Verdict{Outcome: model.OutcomeResolved}, askRB, model.Limits{})
 		if tr.To != model.StateResolved || tr.Incident.Ticket != "" {
 			t.Fatalf("after the replay: %+v", tr.Incident)
 		}
@@ -760,7 +771,7 @@ func TestDueReminders(t *testing.T) {
 	f.Project = "fast"
 	res := e.ingest(f, model.Limits{})
 	e.st.ClaimIncident(res.Incident.ID)
-	e.m.ApplyVerdict(res.Incident, model.Verdict{Outcome: model.OutcomeBlocked}, model.Runbook{}, model.Limits{})
+	e.m.ApplyVerdict(res.Incident, model.Verdict{Outcome: model.OutcomeBlocked}, askRB, model.Limits{})
 	e.inState("stuck-job:3", model.StateWaiting)
 
 	ids := func() string {
@@ -824,7 +835,7 @@ func TestRecoveryAfterRestart(t *testing.T) {
 	if err != nil || next == nil || next.ID != a.ID || next.AgentToken != a.AgentToken || next.Runs != 0 {
 		t.Fatalf("next = %+v, %v", next, err)
 	}
-	if tr, err := m.ApplyVerdict(*next, model.Verdict{Outcome: model.OutcomeResolved}, model.Runbook{}, model.Limits{}); err != nil || tr.To != model.StateResolved {
+	if tr, err := m.ApplyVerdict(*next, model.Verdict{Outcome: model.OutcomeResolved}, askRB, model.Limits{}); err != nil || tr.To != model.StateResolved {
 		t.Fatalf("verdict after the restart: %+v, %v", tr, err)
 	}
 	if due, _ := st.DueRechecks(); len(due) != 1 || due[0].ID != w.ID {
@@ -866,19 +877,19 @@ func TestDossier(t *testing.T) {
 	v := model.Verdict{Outcome: model.OutcomeRecheck, Summary: "Worker 3 holds the lock.", RootCause: "deadlock in the worker",
 		Evidence: []string{"SELECT status FROM jobs → running", "log: lock wait timeout"}, RecheckMinutes: 10,
 		ActionsRun: []string{"restart-job"}, Confidence: "medium"}
-	if _, err := e.m.ApplyVerdict(inc, v, model.Runbook{}, model.Limits{}); err != nil {
+	if _, err := e.m.ApplyVerdict(inc, v, askRB, model.Limits{}); err != nil {
 		t.Fatal(err)
 	}
 	e.clk.Add(10 * time.Minute)
 	e.m.Recheck(inc, true)
 	e.st.ClaimIncident(inc.ID)
-	e.m.RunFailed(inc, model.RunTimeout, model.Limits{})
+	e.m.RunFailed(inc, model.RunTimeout, model.Runbook{}, model.Limits{}, "")
 	e.st.ClaimIncident(inc.ID)
-	e.m.ApplyVerdict(inc, model.Verdict{Outcome: model.OutcomeGreenLight, Ticket: "ssh-prod/42"}, model.Runbook{}, model.Limits{})
+	e.m.ApplyVerdict(inc, model.Verdict{Outcome: model.OutcomeGreenLight, Ticket: "ssh-prod/42"}, askRB, model.Limits{})
 	e.m.GreenLightDecided(inc, model.TicketDenied)
 	e.m.Resume(inc.ID)
 	e.st.ClaimIncident(inc.ID)
-	e.m.RunFailed(inc, model.RunQuota, model.Limits{})
+	e.m.RunFailed(inc, model.RunQuota, model.Runbook{}, model.Limits{}, "")
 	e.m.Close(inc.ID, "fixed by hand")
 
 	journal, err := e.dossier.Journal(inc.ID)
@@ -887,12 +898,12 @@ func TestDossier(t *testing.T) {
 	}
 	wantInOrder := []string{
 		"## 2026-11-18T09:59:00Z — signal", "job stuck: stuck-job:1", "state: queued",
-		"## 2026-11-18T10:05:00Z — pass 1: verdict recheck", "Worker 3 holds the lock.", "**Root cause:** deadlock in the worker",
-		"- SELECT status FROM jobs → running", "- log: lock wait timeout", "**Actions run:** restart-job",
-		"State: investigating → waiting (agent asked for a recheck), recheck at 2026-11-18T10:15:00Z.",
+		"## 2026-11-18T10:05:00Z — pass 1: verdict recheck", "State: investigating → waiting (agent asked for a recheck), recheck at 2026-11-18T10:15:00Z.",
+		"> Worker 3 holds the lock.", "Root cause (agent, untrusted):", "> deadlock in the worker",
+		"> - SELECT status FROM jobs → running", "> - log: lock wait timeout", "> - restart-job",
 		"## 2026-11-18T10:15:00Z — recheck: still firing", "State: waiting → queued",
 		"— pass ended: timeout", "State: investigating → queued (pass failed, one retry).",
-		"— pass 3: verdict green_light", "**Ticket:** ssh-prod/42", "State: investigating → green_light",
+		"— pass 3: verdict green_light", "State: investigating → green_light", "Ticket recorded for this incident: `ssh-prod/42`",
 		"— green light: denied", "State: green_light → escalated (ticket ssh-prod/42 denied).",
 		"— resumed by a human", "State: escalated → queued",
 		"— pass ended: quota", "State: investigating → queued",
@@ -976,7 +987,7 @@ func TestDossierFailureKeepsTheTransition(t *testing.T) {
 		t.Fatalf("ingest = %+v, %v", res, err)
 	}
 	st.ClaimIncident(res.Incident.ID)
-	tr, err := m.ApplyVerdict(res.Incident, model.Verdict{Outcome: model.OutcomeEscalate}, model.Runbook{}, model.Limits{})
+	tr, err := m.ApplyVerdict(res.Incident, model.Verdict{Outcome: model.OutcomeEscalate}, askRB, model.Limits{})
 	if !errors.Is(err, ErrDossier) || tr.To != model.StateEscalated || tr.Alert != model.AlertEscalated {
 		t.Fatalf("verdict = %+v, %v", tr, err)
 	}
@@ -992,3 +1003,6 @@ func TestDossierFailureKeepsTheTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// askRB is a runbook whose ask instance issues the tickets of the tests.
+var askRB = model.Runbook{AskInstance: "ssh-prod"}

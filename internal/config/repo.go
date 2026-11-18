@@ -19,6 +19,7 @@ package config
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -49,7 +50,9 @@ func (r *Repo) Project(slug string) *model.Project {
 // GenericRunbookID is the id of the required fallback runbook.
 const GenericRunbookID = "generic"
 
-// LoadRepo loads and validates the config repository in dir. It reports
+// LoadRepo loads and validates the config repository in dir. A symbolic
+// link (or any entry that is not a regular file or a directory) anywhere
+// under standard/ or projects/ fails the load before anything is read. It reports
 // every problem it finds (errors.Join), each as "<file>: <field>: <why>"
 // with the file relative to dir. Each project's Runbooks hold its own
 // runbooks first, then the standard ones it does not override; its Limits
@@ -59,6 +62,12 @@ func LoadRepo(dir string) (*Repo, error) {
 		return nil, errors.New(dir + ": not a directory")
 	}
 	var el errlist
+	// Nothing is read before the tree is known to hold only regular files
+	// and directories: a link could point outside the reviewed repository.
+	checkTree(dir, &el)
+	if err := el.err(); err != nil {
+		return nil, err
+	}
 	repo := &Repo{Dir: dir}
 
 	repo.Method = readText(dir, "standard/method.md", &el)
@@ -135,6 +144,40 @@ func RunbookFor(p *model.Project, source string) model.Runbook {
 		AppliesTo:      []string{"*"},
 		RecheckDefault: DefaultRecheck,
 		Body:           "Investigate read-only through the locks. Run no action. Conclude with outcome \"escalate\" and your diagnosis.",
+	}
+}
+
+// checkTree walks standard/ and projects/ with Lstat, never following a
+// link, and reports every entry that is not a regular file or a directory:
+// a symbolic link (to a file or a directory, at any depth, action
+// directories and scripts included), a FIFO, a device, a socket.
+func checkTree(dir string, el *errlist) {
+	for _, top := range []string{"standard", "projects"} {
+		root := filepath.Join(dir, top)
+		_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			rel := top
+			if r, rerr := filepath.Rel(dir, p); rerr == nil {
+				rel = filepath.ToSlash(r)
+			}
+			if err != nil {
+				if p == root && errors.Is(err, fs.ErrNotExist) {
+					return nil // a missing directory is the loaders' business
+				}
+				el.addf(rel, "unreadable")
+				if d != nil && d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			switch t := d.Type(); {
+			case t&fs.ModeSymlink != 0:
+				el.addf(rel, "is a symbolic link (the config repository holds regular files and directories only)")
+			case d.IsDir(), t.IsRegular():
+			default:
+				el.addf(rel, "is neither a regular file nor a directory")
+			}
+			return nil
+		})
 	}
 }
 

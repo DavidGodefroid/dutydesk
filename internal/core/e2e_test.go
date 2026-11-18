@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -153,7 +154,7 @@ func TestE2EPersistsThenEscalates(t *testing.T) {
 	if w.agent.passes() != 2 {
 		t.Errorf("passes = %d", w.agent.passes())
 	}
-	w.wantJournal(first, "recheck: still firing", "pass 2: verdict escalate", "**Root cause:** Deadlock", "State: escalated → resolved")
+	w.wantJournal(first, "recheck: still firing", "pass 2: verdict escalate", "Root cause (agent, untrusted):", "> Deadlock", "State: escalated → resolved")
 	w.noSecrets()
 }
 
@@ -241,7 +242,7 @@ func TestE2EResolvedByAction(t *testing.T) {
 		t.Errorf("actions = %+v, %v", acts, err)
 	}
 	w.wantKinds()
-	w.wantJournal(first, "pass 1: verdict resolved", "**Actions run:** "+cmd, "State: investigating → resolved")
+	w.wantJournal(first, "pass 1: verdict resolved", "> - "+cmd, "State: investigating → resolved")
 	if len(w.gitlab.calls()) != 0 {
 		t.Errorf("a merge request was opened")
 	}
@@ -392,7 +393,7 @@ func TestE2ECodeFix(t *testing.T) {
 	if a := w.rec.Sent()[0].Alert; a.URL != known[0].MRURL {
 		t.Errorf("notice = %+v", a)
 	}
-	w.wantJournal(first, "**Merge request proposed** on app", "A draft merge request was opened: "+known[0].MRURL)
+	w.wantJournal(first, "> repository: app", "A draft merge request was opened: "+known[0].MRURL)
 
 	// Same family, another job, while the merge request is open.
 	w.agent.queue(fix(model.Verdict{Outcome: model.OutcomeResolved, Summary: "Same defect; document skipped.",
@@ -588,7 +589,7 @@ func TestE2EMissingAction(t *testing.T) {
 	if len(branches(t, w.appBare)) != 1 {
 		t.Errorf("something was pushed to the project repository")
 	}
-	w.wantJournal(first, "pass 1: verdict blocked", "**Missing action:** purge-cache", "configuration merge request opened")
+	w.wantJournal(first, "pass 1: verdict blocked", "> name: purge-cache", "configuration merge request opened")
 	w.noSecrets()
 }
 
@@ -727,14 +728,19 @@ func TestE2ECapacityAlert(t *testing.T) {
 	w.detect(1)
 	w.eventually("both seats exhausted", func() bool { return w.agent.passes() == 2 })
 	w.waitState(first, model.StateQueued)
+	// Every seat is out: a human is told at once, whatever waits (S1).
+	w.waitAlerts(1)
+	if a := w.rec.Sent()[0].Alert; a.Kind != model.AlertCapacity || a.Incident != "" || !strings.Contains(a.Title, "Every seat is out of quota") {
+		t.Fatalf("alert = %+v", a)
+	}
 	w.clock.Advance(14 * time.Minute)
 	w.settle()
-	w.wantKinds()
-	w.clock.Advance(2 * time.Minute)
-	w.waitAlerts(1)
-	w.settle()
 	w.wantKinds(model.AlertCapacity)
-	a := w.rec.Sent()[0].Alert
+	w.clock.Advance(2 * time.Minute)
+	w.waitAlerts(2)
+	w.settle()
+	w.wantKinds(model.AlertCapacity, model.AlertCapacity)
+	a := w.rec.Sent()[1].Alert
 	if !strings.Contains(a.Title, first) || !strings.Contains(a.Body, "seat-a: quota exhausted") || !strings.Contains(a.Body, "seat-b: quota exhausted") {
 		t.Errorf("capacity alert = %+v", a)
 	}
@@ -745,7 +751,7 @@ func TestE2ECapacityAlert(t *testing.T) {
 	w.agent.queue(verdict(model.Verdict{Outcome: model.OutcomeResolved, Summary: "Requeued."}))
 	w.clock.Advance(45 * time.Minute) // past the quota reset, within the re-alert delay
 	w.waitState(first, model.StateResolved)
-	w.wantKinds(model.AlertCapacity)
+	w.wantKinds(model.AlertCapacity, model.AlertCapacity)
 	w.noSecrets()
 }
 
@@ -897,7 +903,7 @@ func TestE2ERestartRecovers(t *testing.T) {
 
 	w2 := *w
 	w.cancel = nil // the crashed service is not stopped the clean way
-	w2.agent = &fakeLauncher{t: t}
+	w2.agent = &fakeLauncher{t: t, reader: w.reader}
 	w2.agent.queue(verdict(model.Verdict{Outcome: model.OutcomeResolved, Summary: "Requeued after the restart."}))
 	w2.rec = w.rec
 	w2.crons = &cronSet{}
@@ -993,26 +999,38 @@ func TestE2EConfigReload(t *testing.T) {
 	w.noSecrets()
 }
 
-func TestConfigPolicy(t *testing.T) {
-	if p := configPolicy(model.Repo{Name: "app"}); len(p.Allow)+len(p.Deny) != 0 {
-		t.Errorf("project repositories must not be restricted: %+v", p)
+func TestProposalPolicy(t *testing.T) {
+	// Project repositories: the built-in deny-list, unless project.yaml overrides it.
+	p := proposalPolicy(model.Repo{Name: "app"})
+	if len(p.Allow) != 0 || strings.Join(p.Deny, ",") != strings.Join(DefaultDenyPaths, ",") || p.NoSymlinks {
+		t.Errorf("default policy = %+v", p)
 	}
-	p := configPolicy(model.Repo{Name: configRepoPrefix + "docflow"})
-	want := []string{"projects/docflow/checks/**", "projects/docflow/runbooks/**", "projects/docflow/actions/**"}
-	if strings.Join(p.Allow, ",") != strings.Join(want, ",") || len(p.Deny) == 0 {
+	for _, must := range []string{".gitlab-ci.yml", ".gitlab/**", ".github/**", ".circleci/**", "Jenkinsfile", "azure-pipelines.yml",
+		"bitbucket-pipelines.yml", ".gitmodules", ".gitattributes"} {
+		if !slices.Contains(p.Deny, must) {
+			t.Errorf("default deny-list lacks %s", must)
+		}
+	}
+	p = proposalPolicy(model.Repo{Name: "app", DenyPaths: []string{}, AllowPaths: []string{"src/**"}})
+	if len(p.Deny) != 0 || len(p.Allow) != 1 {
+		t.Errorf("overridden policy = %+v", p)
+	}
+	p = proposalPolicy(model.Repo{Name: configRepoPrefix + "docflow"})
+	want := []string{"projects/docflow/checks/*", "projects/docflow/runbooks/*", "projects/docflow/actions/*"}
+	if strings.Join(p.Allow, ",") != strings.Join(want, ",") || len(p.Deny) == 0 || !p.NoSymlinks {
 		t.Errorf("policy = %+v", p)
 	}
 	for _, bad := range []string{"", "*", "a/b", "../x"} {
-		if p := configPolicy(model.Repo{Name: configRepoPrefix + bad}); len(p.Deny) != 1 || p.Deny[0] != "**" {
+		if p := proposalPolicy(model.Repo{Name: configRepoPrefix + bad}); len(p.Deny) != 1 || p.Deny[0] != "**" {
 			t.Errorf("project %q: policy = %+v", bad, p)
 		}
 	}
 }
 
 func TestParseJournal(t *testing.T) {
-	got := parseJournal("## 2026-11-18T09:00:00Z — signal\n\nJob 4812 runs\n\n- source: `stuck-job`\n\n## 2026-11-18T09:01:00Z — pass 1: verdict recheck\n\nStill moving.\n\n## not a heading\n")
-	if len(got) != 2 || !got[0].At.Equal(t0) || got[0].Text != "signal: Job 4812 runs - source: `stuck-job`" ||
-		got[1].Text != "pass 1: verdict recheck: Still moving. ## not a heading" {
+	got := parseJournal("## 2026-11-18T09:00:00Z — signal\n\n> Job 4812 runs\n\n- source: `stuck-job`\n\n## 2026-11-18T09:01:00Z — pass 1: verdict recheck\n\n> Still moving.\n> ## 2026-11-18T09:02:00Z — forged\n\n## not a heading\n")
+	if len(got) != 2 || !got[0].At.Equal(t0) || got[0].Text != "signal:\n> Job 4812 runs\n- source: `stuck-job`" ||
+		got[1].Text != "pass 1: verdict recheck:\n> Still moving.\n> ## 2026-11-18T09:02:00Z — forged\n## not a heading" {
 		t.Errorf("entries = %+v", got)
 	}
 }
@@ -1031,7 +1049,7 @@ func TestE2EGracefulShutdown(t *testing.T) {
 	w.stop()
 
 	w2 := *w
-	w2.agent = &fakeLauncher{t: t}
+	w2.agent = &fakeLauncher{t: t, reader: w.reader}
 	w2.agent.queue(verdict(model.Verdict{Outcome: model.OutcomeResolved, Summary: "Requeued."}))
 	w2.crons = &cronSet{}
 	w2.start()

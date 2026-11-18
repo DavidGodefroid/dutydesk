@@ -17,6 +17,11 @@ import (
 // segment is an object key or, in an array, an index. Only strings,
 // numbers and booleans are kept; a path that leads elsewhere gives no
 // field.
+//
+// The values are as untrusted as Sentry's: a field is kept through
+// mappedText, and the fingerprint (which is also the summary's variable
+// part, so an alert's title) is rendered from the same values reduced to
+// identifiers by ident.
 func generic(body []byte, source string, wh model.Webhook) (delivery, error) {
 	if wh.FingerprintTemplate == "" {
 		return delivery{}, &configError{"the generic webhook has no fingerprint template"}
@@ -28,16 +33,20 @@ func generic(body []byte, source string, wh model.Webhook) (delivery, error) {
 		return delivery{}, errors.New("the body is not JSON")
 	}
 	fields := make(map[string]string, len(wh.Fields))
+	ids := make(map[string]string, len(wh.Fields))
 	for name, path := range wh.Fields {
 		// An empty value is no value: it would give a fingerprint that
 		// merges unrelated problems.
 		if v, ok := lookup(payload, path); ok {
-			if v = clean(v); v != "" {
-				fields[name] = v
+			if t := mappedText(v); t != "" {
+				fields[name] = t
+			}
+			if id := ident(v); id != "" {
+				ids[name] = id
 			}
 		}
 	}
-	fp, err := check.Render(wh.FingerprintTemplate, fields)
+	fp, err := check.Render(wh.FingerprintTemplate, ids)
 	if err != nil {
 		var mf *check.MissingFieldError
 		if errors.As(err, &mf) {

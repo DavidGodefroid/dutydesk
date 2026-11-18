@@ -9,6 +9,11 @@ repos:
     project: acme/docflow
     default_branch: main
     token_file: /etc/dutydesk/secrets/gitlab-docflow.token   # service account: push branches, open MRs, never merge
+    # Paths a DutyDesk merge request may not touch. Key absent: the built-in
+    # list (CI definitions, git plumbing files). "deny_paths: []" lifts it.
+    # deny_paths: [".gitlab-ci.yml", ".github/**", "deploy/**"]
+    # When set, the only paths a merge request may touch.
+    # allow_paths: ["src/**", "tests/**", "docs/**/*.md"]
 
 locks:
   workspace: /srv/locks/docflow    # directory holding .lockfamily/ (served by lox live)
@@ -27,6 +32,8 @@ limits:                            # all optional; these are the defaults
   recurrence_count: 3
   recurrence_window: 168h
   reminder_every: 24h
+  max_green_lights: 3              # green-light rounds per incident, then escalation
+  max_quota_runs: 3                # passes lost to an exhausted seat per incident, then escalation
 
 alerts:
   webhook_url_file: /etc/dutydesk/secrets/docflow-alerts.url   # outgoing webhook (Teams-compatible)

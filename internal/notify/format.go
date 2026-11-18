@@ -47,11 +47,11 @@ func Format(a model.Alert) (title, text string) {
 		parts = append(parts, a.Incident)
 	}
 	title = "[DutyDesk] " + strings.Join(parts, " · ")
-	if t := strings.Join(strings.Fields(a.Title), " "); t != "" {
+	if t := Neutralise(model.CleanLine(a.Title)); t != "" {
 		title += ": " + truncate(t, 160)
 	}
 	var lines []string
-	if body := truncate(strings.TrimSpace(a.Body), maxBody); body != "" {
+	if body := truncate(strings.TrimSpace(Neutralise(a.Body)), maxBody); body != "" {
 		lines = append(lines, body)
 	}
 	if a.Kind == model.AlertGreenLight {
@@ -61,6 +61,23 @@ func Format(a model.Alert) (title, text string) {
 		lines = append(lines, a.URL)
 	}
 	return title, strings.Join(lines, "\n")
+}
+
+var neutraliser = strings.NewReplacer(
+	"<", "‹", ">", "›", // no HTML tag, no autolink <http://…>, no <at> mention
+	"](", "] (", // no inline Markdown link or image target
+	"![", "! [", // no image
+	"]:", "] :", // no reference-style link definition
+	"://", "[:]//", // no bare URL a chat client would make clickable
+)
+
+// Neutralise makes text that may come from an agent or a signal inert in an
+// alert: control characters are stripped, HTML and Markdown links / images
+// are broken and URLs are defanged, so that an alert can show attacker-
+// chosen words but never a clickable link, an image fetch or markup. The
+// URL field of an alert is set by the core and is not part of this.
+func Neutralise(s string) string {
+	return neutraliser.Replace(model.CleanText(s))
 }
 
 func truncate(s string, max int) string {

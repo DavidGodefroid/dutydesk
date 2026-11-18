@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,7 +15,8 @@ import (
 	"github.com/DavidGodefroid/dutydesk/internal/model"
 )
 
-// duration is a Go duration string in YAML ("20m", "168h").
+// duration is a Go duration string in YAML ("20m", "168h"), with one
+// extension: a leading whole number of days ("30d", "1d12h"; a day is 24h).
 type duration time.Duration
 
 func (d *duration) UnmarshalYAML(n *yaml.Node) error {
@@ -22,12 +24,35 @@ func (d *duration) UnmarshalYAML(n *yaml.Node) error {
 	if err := n.Decode(&s); err != nil {
 		return err
 	}
-	v, err := time.ParseDuration(s)
+	v, err := parseDuration(s)
 	if err != nil {
-		return fmt.Errorf("line %d: %q is not a duration (want e.g. \"20m\")", n.Line, s)
+		return fmt.Errorf("line %d: %q is not a duration (want e.g. \"20m\", \"168h\" or \"30d\")", n.Line, s)
 	}
 	*d = duration(v)
 	return nil
+}
+
+var daysRe = regexp.MustCompile(`^([0-9]{1,5})d(.*)$`)
+
+// parseDuration is time.ParseDuration plus a leading "<n>d" (n days of 24h).
+func parseDuration(s string) (time.Duration, error) {
+	m := daysRe.FindStringSubmatch(s)
+	if m == nil {
+		return time.ParseDuration(s)
+	}
+	days, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, err
+	}
+	v := time.Duration(days) * 24 * time.Hour
+	if m[2] == "" {
+		return v, nil
+	}
+	rest, err := time.ParseDuration(m[2])
+	if err != nil || rest < 0 {
+		return 0, errors.New("not a duration")
+	}
+	return v + rest, nil
 }
 
 // decodeStrict decodes exactly one YAML document; an unknown key is an error.

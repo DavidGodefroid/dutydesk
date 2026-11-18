@@ -2,7 +2,6 @@ package actions
 
 import (
 	"os"
-	"path"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -143,32 +142,16 @@ func TestCommandLine(t *testing.T) {
 	}
 }
 
-// locksshMatch applies lockssh v0.2.0's documented allow-rule semantics
-// (docs/usage.md, "Allow rules") for the token kinds DutyDesk generates.
-func locksshMatch(rule string, argv []string) bool {
-	tokens := strings.Split(rule, " ")
-	if len(tokens) != len(argv) {
-		return false
+// locksshMatch is lockssh's allow-rule matching (see realLocksshMatch).
+func locksshMatch(rule string, argv []string) bool { return realLocksshMatch(rule, argv) }
+
+// skipRules are the rules of project()'s skip-document: one per length.
+func skipRules() []string {
+	var out []string
+	for n := 1; n <= 12; n++ {
+		out = append(out, "/opt/dutydesk/bin/dutydesk-act skip-document --document-id doc-"+strings.Repeat("[0-9]", n))
 	}
-	for i, tok := range tokens {
-		arg := argv[i]
-		if i == 0 || !strings.ContainsAny(tok, "*?[") {
-			if tok != arg {
-				return false
-			}
-			continue
-		}
-		if (strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "+")) && arg[0] != tok[0] {
-			return false
-		}
-		if arg == "." || arg == ".." {
-			return false
-		}
-		if ok, err := path.Match(tok, arg); err != nil || !ok {
-			return false
-		}
-	}
-	return true
+	return out
 }
 
 func project() *model.Project {
@@ -208,25 +191,29 @@ func TestLockSSHRules(t *testing.T) {
 		t.Fatalf("got %d profiles, want 4", len(rules))
 	}
 	auto := rules["docflow-stuck-job"]
-	wantAllow := []string{
-		"/opt/dutydesk/bin/dutydesk-act requeue-job --job-id [0-9]* --reason * --tag *",
-		"/opt/dutydesk/bin/dutydesk-act skip-document --document-id *",
-	}
+	// One rule per enum value; the tag is too long for one rule per length.
+	wantAllow := append([]string{
+		"/opt/dutydesk/bin/dutydesk-act requeue-job --job-id [0-9]* --reason stalled --tag [.0-9_a-z]*",
+		"/opt/dutydesk/bin/dutydesk-act requeue-job --job-id [0-9]* --reason worker-lost --tag [.0-9_a-z]*",
+	}, skipRules()...)
 	if !reflect.DeepEqual(auto.Allow(), wantAllow) || auto.Run != "auto" || auto.Exec {
 		t.Errorf("auto profile = %+v", auto)
 	}
 	ask := rules["docflow-bad-status"]
-	if !reflect.DeepEqual(ask.Allow(), []string{"/opt/dutydesk/bin/dutydesk-act reset-job-status --job-id [0-9]* --status *"}) ||
-		ask.Run != "ask" || ask.Exec {
+	if !reflect.DeepEqual(ask.Allow(), []string{
+		"/opt/dutydesk/bin/dutydesk-act reset-job-status --job-id [0-9]* --status queued",
+		"/opt/dutydesk/bin/dutydesk-act reset-job-status --job-id [0-9]* --status failed",
+	}) || ask.Run != "ask" || ask.Exec {
 		t.Errorf("ask profile = %+v", ask)
 	}
 	// A runbook with both levels gets two profiles: its auto actions stay free.
-	if m, k := rules["docflow-mixed"], rules["docflow-mixed-ask"]; m.Run != "auto" || len(m.Rules) != 1 || m.Rules[0].Action != "requeue-job" ||
-		k.Run != "ask" || len(k.Rules) != 1 || k.Rules[0].Action != "reset-job-status" {
+	if m, k := rules["docflow-mixed"], rules["docflow-mixed-ask"]; m.Run != "auto" || len(m.Rules) != 2 || m.Rules[0].Action != "requeue-job" ||
+		k.Run != "ask" || len(k.Rules) != 2 || k.Rules[1].Action != "reset-job-status" {
 		t.Errorf("mixed runbook profiles = %+v / %+v", m, k)
 	}
 
 	// The command line of valid args matches its rule; hostile argvs do not.
+	// (A tag of ".." is left to the launcher: a glob cannot exclude it.)
 	a := p.Actions["requeue-job"]
 	args := map[string]string{"job-id": "42", "reason": "stalled", "tag": "t1"}
 	if err := ValidateArgs(a, args); err != nil {
@@ -236,15 +223,20 @@ func TestLockSSHRules(t *testing.T) {
 	if !locksshMatch(rule, CommandLine(a, "/opt/dutydesk/bin", args)) {
 		t.Errorf("rule %q does not match its own command line", rule)
 	}
+	if locksshMatch(wantAllow[1], CommandLine(a, "/opt/dutydesk/bin", args)) {
+		t.Errorf("rule %q matches another enum value", wantAllow[1])
+	}
 	for _, argv := range [][]string{
 		{"/opt/dutydesk/bin/dutydesk-act", "requeue-job", "--job-id", "42", "--reason", "stalled", "--tag", "a/b"},
 		{"/opt/dutydesk/bin/dutydesk-act", "requeue-job", "--job-id", "-1", "--reason", "stalled", "--tag", "t"},
 		{"/opt/dutydesk/bin/dutydesk-act", "requeue-job", "--job-id", "x", "--reason", "stalled", "--tag", "t"},
-		{"/opt/dutydesk/bin/dutydesk-act", "requeue-job", "--job-id", "42", "--reason", "stalled", "--tag", ".."},
 		{"/opt/dutydesk/bin/dutydesk-act", "requeue-job", "--job-id", "42", "--reason", "stalled", "--tag", "t", "extra"},
 		{"/opt/dutydesk/bin/dutydesk-act", "other", "--job-id", "42", "--reason", "stalled", "--tag", "t"},
 		{"/tmp/dutydesk-act", "requeue-job", "--job-id", "42", "--reason", "stalled", "--tag", "t"},
 		{"/opt/dutydesk/bin/dutydesk-act", "requeue-job", "--tag", "t", "--reason", "stalled", "--job-id", "42"},
+		{"/opt/dutydesk/bin/dutydesk-act", "requeue-job", "--job-id", "42", "--reason", "other", "--tag", "t"},
+		{"/opt/dutydesk/bin/dutydesk-act", "requeue-job", "--job-id", "42", "--reason", "stalled", "--tag", "-rf"},
+		{"/opt/dutydesk/bin/dutydesk-act", "requeue-job", "--job-id", "42", "--reason", "stalled", "--tag", "$(id)"},
 	} {
 		if locksshMatch(rule, argv) {
 			t.Errorf("rule %q matches %q", rule, argv)
@@ -313,7 +305,8 @@ func TestRenderTOML(t *testing.T) {
 [profiles.docflow-bad-status]
 exec  = false
 allow = [
-  "/opt/dutydesk/bin/dutydesk-act reset-job-status --job-id [0-9]* --status *",
+  "/opt/dutydesk/bin/dutydesk-act reset-job-status --job-id [0-9]* --status queued",
+  "/opt/dutydesk/bin/dutydesk-act reset-job-status --job-id [0-9]* --status failed",
 ]
 
 [profiles.docflow-bad-status.auto]
@@ -327,14 +320,19 @@ exec = "deny"
 [profiles.docflow-stuck-job]
 exec  = false
 allow = [
-  "/opt/dutydesk/bin/dutydesk-act requeue-job --job-id [0-9]* --reason * --tag *",
-  "/opt/dutydesk/bin/dutydesk-act skip-document --document-id *",
-]
+  "/opt/dutydesk/bin/dutydesk-act requeue-job --job-id [0-9]* --reason stalled --tag [.0-9_a-z]*",
+  "/opt/dutydesk/bin/dutydesk-act requeue-job --job-id [0-9]* --reason worker-lost --tag [.0-9_a-z]*",
+SKIPRULES]
 
 [profiles.docflow-stuck-job.auto]
 run  = "auto"
 exec = "deny"
 `
+	var skip strings.Builder
+	for _, r := range skipRules() {
+		skip.WriteString("  \"" + r + "\",\n")
+	}
+	want = strings.Replace(want, "SKIPRULES", skip.String(), 1)
 	if got := RenderTOML("docflow", rules); got != want {
 		t.Errorf("got:\n%s\nwant:\n%s", got, want)
 	}

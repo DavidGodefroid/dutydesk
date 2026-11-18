@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -24,6 +25,9 @@ type projectFile struct {
 		Project       string `yaml:"project"`
 		DefaultBranch string `yaml:"default_branch"`
 		TokenFile     string `yaml:"token_file"`
+		// Pointers: an absent (or null) key and an empty list differ.
+		DenyPaths  *[]string `yaml:"deny_paths"`
+		AllowPaths *[]string `yaml:"allow_paths"`
 	} `yaml:"repos"`
 	Locks struct {
 		Workspace string `yaml:"workspace"`
@@ -44,6 +48,8 @@ type projectFile struct {
 		RecurrenceCount    int      `yaml:"recurrence_count"`
 		RecurrenceWindow   duration `yaml:"recurrence_window"`
 		ReminderEvery      duration `yaml:"reminder_every"`
+		MaxGreenLights     int      `yaml:"max_green_lights"`
+		MaxQuotaRuns       int      `yaml:"max_quota_runs"`
 	} `yaml:"limits"`
 	Alerts struct {
 		WebhookURLFile string `yaml:"webhook_url_file"`
@@ -72,6 +78,44 @@ type checkFile struct {
 	LogWindow   duration `yaml:"log_window"`
 	Threshold   int      `yaml:"threshold"`
 	Source      string   `yaml:"source"`
+}
+
+// ValidatePathGlob checks one deny_paths / allow_paths pattern: a path glob
+// anchored at the repository root, with "/" separators, "*" and "?" inside
+// a segment (path.Match syntax) and "**" as a whole segment for any number
+// of segments. The error never needs the file: it says what is wrong.
+func ValidatePathGlob(g string) error {
+	switch {
+	case g == "":
+		return errors.New("empty pattern")
+	case len(g) > 512:
+		return errors.New("longer than 512 bytes")
+	case strings.Contains(g, `\`):
+		return errors.New("a backslash is not allowed (use \"/\" separators, no escaping)")
+	case strings.HasPrefix(g, "/"):
+		return errors.New("want a path relative to the repository root, not an absolute path")
+	}
+	for _, r := range g {
+		if r < 0x20 || r == 0x7F {
+			return errors.New("a control character is not allowed")
+		}
+	}
+	for _, seg := range strings.Split(g, "/") {
+		switch {
+		case seg == "":
+			return errors.New("empty path segment (no \"//\", no trailing \"/\")")
+		case seg == "." || seg == "..":
+			return errors.New("\".\" and \"..\" segments are not allowed")
+		case seg == "**":
+		case strings.Contains(seg, "**"):
+			return errors.New("\"**\" must be a whole path segment")
+		default:
+			if _, err := path.Match(seg, ""); err != nil {
+				return errors.New("a segment is not a valid glob")
+			}
+		}
+	}
+	return nil
 }
 
 func httpURL(s string) bool {
@@ -122,8 +166,26 @@ func loadProject(root, slug string, repo *Repo, el *errlist) *model.Project {
 		if !filepath.IsAbs(r.TokenFile) {
 			el.addf(file, "%s.token_file: want an absolute path", f)
 		}
-		p.Repos = append(p.Repos, model.Repo{Name: r.Name, Forge: r.Forge, URL: r.URL, Project: r.Project,
-			DefaultBranch: r.DefaultBranch, TokenFile: r.TokenFile})
+		mr := model.Repo{Name: r.Name, Forge: r.Forge, URL: r.URL, Project: r.Project,
+			DefaultBranch: r.DefaultBranch, TokenFile: r.TokenFile}
+		// Key absent (or null): nil, the core applies its built-in deny-list.
+		// "deny_paths: []": a non-nil empty list, the restriction is lifted.
+		for _, pl := range []struct {
+			key string
+			in  *[]string
+			out *[]string
+		}{{"deny_paths", r.DenyPaths, &mr.DenyPaths}, {"allow_paths", r.AllowPaths, &mr.AllowPaths}} {
+			if pl.in == nil {
+				continue
+			}
+			*pl.out = append([]string{}, *pl.in...)
+			for j, g := range *pl.in {
+				if err := ValidatePathGlob(g); err != nil {
+					el.addf(file, "%s.%s[%d]: %v", f, pl.key, j, err)
+				}
+			}
+		}
+		p.Repos = append(p.Repos, mr)
 	}
 	p.Locks = model.Locks{Workspace: pf.Locks.Workspace, SQL: pf.Locks.SQL, Log: pf.Locks.Log, MQ: pf.Locks.MQ, File: pf.Locks.File}
 	if !filepath.IsAbs(p.Locks.Workspace) {
@@ -146,6 +208,8 @@ func loadProject(root, slug string, repo *Repo, el *errlist) *model.Project {
 		RecurrenceCount:    pf.Limits.RecurrenceCount,
 		RecurrenceWindow:   time.Duration(pf.Limits.RecurrenceWindow),
 		ReminderEvery:      time.Duration(pf.Limits.ReminderEvery),
+		MaxGreenLights:     pf.Limits.MaxGreenLights,
+		MaxQuotaRuns:       pf.Limits.MaxQuotaRuns,
 	})
 	if err := ValidateLimits(p.Limits); err != nil {
 		for _, line := range strings.Split(err.Error(), "\n") {

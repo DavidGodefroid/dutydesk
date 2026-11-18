@@ -4,13 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp/syntax"
 	"sort"
 	"strings"
 
 	"github.com/DavidGodefroid/dutydesk/internal/model"
 )
 
-// Rule is one lockssh allow rule, for one action.
+// Rule is one lockssh allow rule, for one action. An action has one rule
+// or several (one per enum value, see AllowRules).
 type Rule struct {
 	Action string
 	Level  model.ActionLevel
@@ -36,7 +38,7 @@ type ProfileRules struct {
 	Runbooks []string // runbook ids served by this profile
 	Run      string   // "auto" | "ask"
 	Exec     bool     // always false
-	Rules    []Rule   // sorted by action name
+	Rules    []Rule   // sorted by action name; the rules of one action are adjacent
 }
 
 // Allow lists the allow rules, in order.
@@ -48,28 +50,348 @@ func (pr ProfileRules) Allow() []string {
 	return out
 }
 
-// AllowRule is the lockssh allow rule of one action: the literal launcher
-// path, the literal action name, then for each parameter in manifest order
-// the literal --name and ONE glob token for its value ("[0-9]*" for an
-// int, "*" otherwise). lockssh globs never match "/", an argument starting
-// with "-" or "+", nor a "." / ".." segment; ValidateArgs refuses the same
-// values, and the launcher re-validates types and bounds on the host.
-func AllowRule(a model.Action, installDir string) (string, error) {
+// MaxRulesPerAction caps the allow rules generated for one action (the
+// product of its enum values and of the exact lengths of its strings). A
+// parameter that would exceed it falls back to its tightest single glob.
+const MaxRulesPerAction = 16
+
+// maxGlobLen bounds one generated glob token, far under lockssh's 4096
+// bytes per token.
+const maxGlobLen = 1024
+
+// AllowRules are the lockssh allow rules of one action: the literal
+// launcher path, the literal action name, then for each parameter in
+// manifest order the literal --name and ONE token for its value. lockssh
+// matches a token with "*", "?" or "[" as a path.Match glob over one
+// argument and any other token literally, so the value token is:
+//
+//   - int: "[0-9]*";
+//   - enum: the value itself, one rule per value (the product over several
+//     enums, in manifest order) while the action stays within
+//     MaxRulesPerAction; an enum that does not fit becomes the common
+//     prefix of its values, the class of the characters that follow, "*";
+//   - string: what its pattern allows, as far as a glob can say it. A
+//     fixed shape ("^doc-[0-9a-f]{8}$") is matched character by character;
+//     a shape ending with a bounded repetition gets one exact rule per
+//     length while that fits the budget left by the enums; otherwise the
+//     fixed leading part followed by "*". When nothing can be derived the
+//     token is the class of a first character followed by "*".
+//
+// A glob has no "one or more of this class": after "*" the remaining
+// characters are only bounded by "/" at lockssh, and by the launcher,
+// which re-validates every value (class, type, bounds, pattern) on the
+// host. No token ever matches a value starting with "-" or "+".
+func AllowRules(a model.Action, installDir string) ([]string, error) {
 	if err := checkInstallDir(installDir); err != nil {
-		return "", err
+		return nil, err
 	}
 	if err := ValidateAction(a); err != nil {
-		return "", fmt.Errorf("action %s: %w", a.Name, err)
+		return nil, fmt.Errorf("action %s: %w", a.Name, err)
 	}
-	tokens := []string{filepath.Join(installDir, LauncherName), a.Name}
-	for _, p := range a.Params {
-		glob := "*"
-		if p.Type == "int" {
-			glob = "[0-9]*"
+	// Per parameter: the exact tokens (nil: none) and the single loose one.
+	exact := make([][]string, len(a.Params))
+	loose := make([]string, len(a.Params))
+	for i, p := range a.Params {
+		switch p.Type {
+		case "int":
+			loose[i] = "[0-9]*"
+		case "enum":
+			exact[i], loose[i] = p.Enum, enumGlob(p.Enum)
+		default:
+			exact[i], loose[i] = patternGlobs(p.Pattern)
 		}
-		tokens = append(tokens, "--"+p.Name, glob)
 	}
-	return strings.Join(tokens, " "), nil
+	// Enums take the budget first, then strings, each in manifest order.
+	choice := make([][]string, len(a.Params))
+	n := 1
+	for _, typ := range []string{"enum", "string"} {
+		for i, p := range a.Params {
+			if p.Type != typ {
+				continue
+			}
+			if len(exact[i]) > 0 && n*len(exact[i]) <= MaxRulesPerAction {
+				choice[i] = exact[i]
+				n *= len(exact[i])
+			}
+		}
+	}
+	rules := []string{filepath.Join(installDir, LauncherName) + " " + a.Name}
+	for i, p := range a.Params {
+		tokens := choice[i]
+		if tokens == nil {
+			tokens = []string{loose[i]}
+		}
+		next := make([]string, 0, len(rules)*len(tokens))
+		for _, r := range rules {
+			for _, t := range tokens {
+				next = append(next, r+" --"+p.Name+" "+t)
+			}
+		}
+		rules = next
+	}
+	return rules, nil
+}
+
+// byteSet is a set of characters of SafeValueClass.
+type byteSet [128]bool
+
+func (s *byteSet) count() (n int) {
+	for _, in := range s {
+		if in {
+			n++
+		}
+	}
+	return n
+}
+
+// firstCharSet is what a value may start with: the safe class without
+// "-" and "+".
+func firstCharSet() *byteSet {
+	var s byteSet
+	for c := byte(0); c < 128; c++ {
+		s[c] = safeByte(c) && c != '-' && c != '+'
+	}
+	return &s
+}
+
+// globAtom renders the set as one glob element: the character itself, or
+// a class. No character of SafeValueClass is special outside a class;
+// inside one only "-" is, and it is escaped.
+func globAtom(s *byteSet) string {
+	var b strings.Builder
+	single := s.count() == 1
+	if !single {
+		b.WriteByte('[')
+	}
+	for c := 0; c < 128; c++ {
+		if !s[c] {
+			continue
+		}
+		end := c
+		for alnum(byte(c)) && end+1 < 128 && s[end+1] && alnum(byte(end+1)) {
+			end++
+		}
+		switch {
+		case end-c >= 2:
+			b.WriteByte(byte(c))
+			b.WriteByte('-')
+			b.WriteByte(byte(end))
+			c = end
+		case c == '-' && !single:
+			b.WriteString(`\-`)
+		default:
+			b.WriteByte(byte(c))
+		}
+	}
+	if !single {
+		b.WriteByte(']')
+	}
+	return b.String()
+}
+
+func alnum(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+}
+
+// renderGlob renders a sequence of sets. In first position "-" and "+" are
+// dropped from a class: a value never starts with them.
+func renderGlob(sets []*byteSet) string {
+	var b strings.Builder
+	for i, s := range sets {
+		if i == 0 && (s['-'] || s['+']) {
+			t := *s
+			t['-'], t['+'] = false, false
+			if t.count() > 0 {
+				s = &t
+			}
+		}
+		b.WriteString(globAtom(s))
+	}
+	return b.String()
+}
+
+// enumGlob is the tightest single glob over the values of an enum: their
+// common prefix, the class of the characters that follow it, then "*".
+func enumGlob(values []string) string {
+	prefix := values[0]
+	for _, v := range values[1:] {
+		for !strings.HasPrefix(v, prefix) {
+			prefix = prefix[:len(prefix)-1]
+		}
+	}
+	var sets []*byteSet
+	for i := 0; i < len(prefix); i++ {
+		var s byteSet
+		s[prefix[i]] = true
+		sets = append(sets, &s)
+	}
+	var next byteSet
+	for _, v := range values {
+		if len(v) == len(prefix) {
+			// One value is the prefix itself: nothing has to follow it.
+			next = byteSet{}
+			break
+		}
+		next[v[len(prefix)]] = true
+	}
+	if next.count() > 0 {
+		sets = append(sets, &next)
+	}
+	if len(sets) == 0 {
+		sets = append(sets, firstCharSet())
+	}
+	return renderGlob(sets) + "*"
+}
+
+// patternGlobs turns a validated string pattern into glob tokens: exact is
+// the complete list of globs matching exactly the shapes the pattern
+// allows (nil when a glob cannot say it, or not within MaxRulesPerAction);
+// loose is one glob matching at least every value the pattern allows.
+func patternGlobs(pattern string) (exact []string, loose string) {
+	generic := renderGlob([]*byteSet{firstCharSet()}) + "*"
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil || re.Op != syntax.OpConcat || len(re.Sub) < 3 {
+		return nil, generic
+	}
+	var (
+		sets  []*byteSet // the fixed leading part
+		size  int        // its rendered length, bounded by maxGlobLen
+		open  bool       // something follows that a glob cannot say
+		tail  *byteSet   // a final bounded repetition of one set...
+		extra int        // ...0 to extra more times
+	)
+	push := func(s *byteSet) bool {
+		if n := len(globAtom(s)); size+n <= maxGlobLen {
+			sets, size = append(sets, s), size+n
+			return true
+		}
+		open = true
+		return false
+	}
+	// single is the set of a one-character expression, or nil.
+	single := func(e *syntax.Regexp) *byteSet {
+		for e.Op == syntax.OpCapture {
+			e = e.Sub[0]
+		}
+		var s byteSet
+		switch {
+		case e.Op == syntax.OpLiteral && len(e.Rune) == 1 && e.Flags&syntax.FoldCase == 0 && safeRune(e.Rune[0]):
+			s[e.Rune[0]] = true
+		case e.Op == syntax.OpCharClass:
+			for i := 0; i+1 < len(e.Rune); i += 2 {
+				for r := e.Rune[i]; r <= e.Rune[i+1]; r++ {
+					if !safeRune(r) {
+						return nil
+					}
+					s[r] = true
+				}
+			}
+		default:
+			return nil
+		}
+		if s.count() == 0 {
+			return nil
+		}
+		return &s
+	}
+	// emit appends e to the fixed part; false once the glob is open.
+	var emit func(e *syntax.Regexp, last bool) bool
+	emit = func(e *syntax.Regexp, last bool) bool {
+		switch e.Op {
+		case syntax.OpEmptyMatch:
+			return true
+		case syntax.OpCapture:
+			return emit(e.Sub[0], last)
+		case syntax.OpConcat:
+			for i, sub := range e.Sub {
+				if !emit(sub, last && i == len(e.Sub)-1) {
+					return false
+				}
+			}
+			return true
+		case syntax.OpLiteral:
+			if e.Flags&syntax.FoldCase != 0 {
+				open = true
+				return false
+			}
+			for _, r := range e.Rune {
+				if !safeRune(r) {
+					open = true
+					return false
+				}
+				var s byteSet
+				s[r] = true
+				if !push(&s) {
+					return false
+				}
+			}
+			return true
+		case syntax.OpCharClass:
+			if s := single(e); s != nil {
+				return push(s)
+			}
+		case syntax.OpRepeat, syntax.OpPlus, syntax.OpStar, syntax.OpQuest:
+			lo, hi := e.Min, e.Max
+			switch e.Op {
+			case syntax.OpPlus:
+				lo, hi = 1, -1
+			case syntax.OpStar:
+				lo, hi = 0, -1
+			case syntax.OpQuest:
+				lo, hi = 0, 1
+			}
+			s := single(e.Sub[0])
+			if s == nil {
+				break
+			}
+			for i := 0; i < lo; i++ {
+				if !push(s) {
+					return false
+				}
+			}
+			switch {
+			case hi == lo:
+				return true
+			case last && hi > lo:
+				tail, extra = s, hi-lo
+				return true
+			}
+		}
+		open = true
+		return false
+	}
+	body := re.Sub[1 : len(re.Sub)-1]
+	for i, sub := range body {
+		if !emit(sub, i == len(body)-1) {
+			break
+		}
+	}
+	switch {
+	case len(sets) == 0 && (open || tail != nil && extra+1 > MaxRulesPerAction):
+		return nil, generic
+	case open:
+		return nil, renderGlob(sets) + "*"
+	case len(sets) == 0 && tail == nil:
+		return nil, generic
+	case tail == nil:
+		g := renderGlob(sets)
+		return []string{g}, g
+	}
+	loose = renderGlob(sets) + "*"
+	if len(sets) == 0 {
+		loose = generic
+	}
+	if extra+1 > MaxRulesPerAction || size+extra*len(globAtom(tail)) > maxGlobLen {
+		return nil, loose
+	}
+	all := sets
+	for k := 0; k <= extra; k++ {
+		if len(all) > 0 { // the empty value is never valid
+			exact = append(exact, renderGlob(all))
+		}
+		all = append(all[:len(all):len(all)], tail)
+	}
+	return exact, loose
 }
 
 // checkInstallDir: the program token of a rule is literal, tokens are
@@ -114,15 +436,17 @@ func LockSSHRules(p *model.Project, installDir string) (map[string]ProfileRules,
 			if !ok {
 				return nil, fmt.Errorf("runbook %s: action %s is not in the catalogue of project %s", rb.ID, name, p.Slug)
 			}
-			allow, err := AllowRule(a, installDir)
+			allow, err := AllowRules(a, installDir)
 			if err != nil {
 				return nil, fmt.Errorf("runbook %s: %w", rb.ID, err)
 			}
-			rule := Rule{Action: name, Level: a.Level, Allow: allow}
-			if a.Level == model.ActionAuto {
-				auto.Rules = append(auto.Rules, rule)
-			} else {
-				ask.Rules = append(ask.Rules, rule)
+			for _, al := range allow {
+				rule := Rule{Action: name, Level: a.Level, Allow: al}
+				if a.Level == model.ActionAuto {
+					auto.Rules = append(auto.Rules, rule)
+				} else {
+					ask.Rules = append(ask.Rules, rule)
+				}
 			}
 		}
 		if rb.ActionInstance != "" && rb.ActionInstance == rb.AskInstance {
@@ -178,8 +502,10 @@ func RenderTOML(project string, rules map[string]ProfileRules) string {
 	for _, k := range keys {
 		pr := rules[k]
 		fmt.Fprintf(&b, "\n# runbook: %s\n", strings.Join(pr.Runbooks, ", "))
-		for _, r := range pr.Rules {
-			fmt.Fprintf(&b, "#   %-12s %s\n", r.Level, r.Action)
+		for i, r := range pr.Rules {
+			if i == 0 || pr.Rules[i-1].Action != r.Action { // an action may have several rules
+				fmt.Fprintf(&b, "#   %-12s %s\n", r.Level, r.Action)
+			}
 		}
 		if pr.Run == "ask" {
 			b.WriteString("# green-light: every command is a ticket decided by a human.\n")

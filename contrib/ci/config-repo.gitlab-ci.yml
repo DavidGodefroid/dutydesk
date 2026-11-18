@@ -31,6 +31,15 @@ validate:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   script:
+    # Regular files and directories only. `dutydesk config validate` refuses
+    # a symbolic link as well; this check does not depend on it.
+    - &no-links |
+      odd="$(find standard projects \( -type l -o ! -type f ! -type d \) -print 2>/dev/null || true)"
+      if [ -n "$odd" ]; then
+        echo "symbolic links and special files are refused in the config repository:"
+        echo "$odd"
+        exit 1
+      fi
     - dutydesk config validate .
     - |
       for s in projects/*/actions/*/*.sh; do
@@ -61,19 +70,41 @@ deploy-actions:
   needs: [validate]
   environment: action-host
   script:
+    - *no-links
     # One flat catalogue: <ACTIONS_DIR>/<action>/{action.yaml,script}. Action
     # names must be unique across the projects that share an action host.
+    # Nothing is copied as it is: each REGULAR file is installed with an
+    # explicit mode (0755 when it is executable, else 0644), so a symbolic
+    # link can neither be kept nor followed; an action directory holds
+    # files only.
     - mkdir -p catalogue
     - |
       for a in projects/*/actions/*/; do
-        [ -d "$a" ] || continue
+        [ -d "$a" ] && [ ! -L "${a%/}" ] || continue
         name="$(basename "$a")"
         [ ! -e "catalogue/$name" ] || { echo "action $name is defined by two projects"; exit 1; }
-        cp -r "$a" "catalogue/$name"
+        install -d -m 0755 "catalogue/$name"
+        for f in "$a"* "$a".[!.]*; do
+          [ -e "$f" ] || [ -L "$f" ] || continue
+          if [ -L "$f" ] || [ ! -f "$f" ]; then
+            echo "$f is not a regular file (links and directories are refused in an action)"
+            exit 1
+          fi
+          if [ -x "$f" ]; then
+            install -m 0755 "$f" "catalogue/$name/"
+          else
+            install -m 0644 "$f" "catalogue/$name/"
+          fi
+        done
       done
+    - |
+      odd="$(find catalogue \( -type l -o ! -type f ! -type d \) -print)"
+      [ -z "$odd" ] || { echo "the staged catalogue holds links or special files:"; echo "$odd"; exit 1; }
     # The key is a file variable: it stays where the runner put it (mode 0600 required by ssh).
     - chmod 0600 "$ACTION_HOST_KEY"
+    # --no-links: rsync never creates a symbolic link on the action host
+    # (dutydesk-act refuses them anyway). Modes are the explicit ones above.
     - >
-      rsync -rlpt --delete --chmod=D0755,Fgo-w
+      rsync -rpt --no-links --delete --chmod=D0755,Fgo-w
       -e "ssh -i $ACTION_HOST_KEY -o UserKnownHostsFile=$ACTION_HOST_KNOWN -o StrictHostKeyChecking=yes"
       catalogue/ "$ACTION_HOST:$ACTIONS_DIR/"

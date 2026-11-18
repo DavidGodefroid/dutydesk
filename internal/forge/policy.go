@@ -13,9 +13,13 @@ import (
 //
 // With a non-empty Allow, every changed path must match one Allow pattern.
 // No changed path may match a Deny pattern.
+//
+// With NoSymlinks, no changed path may be a symbolic link, wherever it points.
 type PathPolicy struct {
 	Allow []string
 	Deny  []string
+	// NoSymlinks refuses every added or modified symbolic link (ErrForbiddenPath).
+	NoSymlinks bool
 }
 
 func splitPattern(p string) []string {

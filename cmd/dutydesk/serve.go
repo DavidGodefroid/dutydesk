@@ -52,7 +52,8 @@ func newLauncher(d *config.Daemon) (*agent.Launcher, error) {
 		Network: d.Agent.Network, HTTPSProxy: d.Agent.HTTPSProxy, NoProxy: d.Agent.NoProxy,
 		MCPConfigPath: d.Agent.MCPConfig, ExtraMounts: d.Agent.ExtraMounts, RunArgs: d.Agent.RunArgs,
 		User: d.Agent.User, Memory: d.Agent.Memory, CPUs: d.Agent.CPUs, PidsLimit: d.Agent.PidsLimit,
-		Tokens: core.SeatTokens(d.Seats),
+		MaxTranscriptBytes: d.Agent.MaxTranscriptBytes,
+		Tokens:             core.SeatTokens(d.Seats),
 	})
 }
 

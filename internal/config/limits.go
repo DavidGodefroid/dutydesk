@@ -29,6 +29,8 @@ func DefaultLimits() model.Limits {
 		RecurrenceCount:    3,
 		RecurrenceWindow:   7 * 24 * time.Hour,
 		ReminderEvery:      24 * time.Hour,
+		MaxGreenLights:     3,
+		MaxQuotaRuns:       3,
 	}
 }
 
@@ -56,6 +58,8 @@ func WithDefaults(l model.Limits) model.Limits {
 	pickInt(&l.RecurrenceCount, d.RecurrenceCount)
 	pickDur(&l.RecurrenceWindow, d.RecurrenceWindow)
 	pickDur(&l.ReminderEvery, d.ReminderEvery)
+	pickInt(&l.MaxGreenLights, d.MaxGreenLights)
+	pickInt(&l.MaxQuotaRuns, d.MaxQuotaRuns)
 	return l
 }
 
@@ -84,5 +88,7 @@ func ValidateLimits(l model.Limits) error {
 	intIn("recurrence_count", l.RecurrenceCount, 2, 1000)
 	durIn("recurrence_window", l.RecurrenceWindow, time.Hour, 365*24*time.Hour)
 	durIn("reminder_every", l.ReminderEvery, 10*time.Minute, 30*24*time.Hour)
+	intIn("max_green_lights", l.MaxGreenLights, 1, 20)
+	intIn("max_quota_runs", l.MaxQuotaRuns, 1, 20)
 	return errors.Join(errs...)
 }

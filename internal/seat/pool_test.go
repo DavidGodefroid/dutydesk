@@ -381,3 +381,40 @@ func TestConcurrentUse(t *testing.T) {
 		}
 	}
 }
+
+// S1: a reported quota reset cannot take a seat out beyond the cap.
+func TestExhaustionIsCapped(t *testing.T) {
+	now := time.Date(2026, 11, 18, 9, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	st := &memState{m: map[string]time.Time{"old": now.Add(30 * 24 * time.Hour)}}
+	p, err := New([]model.Seat{{Name: "a"}, {Name: "old"}}, st, WithClock(clock), WithMaxExhaustion(100*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The configured cap itself is bounded, and a saved mark is cut down.
+	if got := p.Stats()[1].ExhaustedUntil; !got.Equal(now.Add(MaxExhaustion)) {
+		t.Errorf("saved mark = %v", got)
+	}
+	p, _ = New([]model.Seat{{Name: "a"}}, st, WithClock(clock))
+	if err := p.MarkExhausted("a", now.Add(32*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.Stats()[0].ExhaustedUntil; !got.Equal(now.Add(DefaultMaxExhaustion)) || !st.m["a"].Equal(got) {
+		t.Errorf("exhausted until %v (saved %v), want now + %s", got, st.m["a"], DefaultMaxExhaustion)
+	}
+	if !p.AllExhausted() {
+		t.Error("AllExhausted = false")
+	}
+	now = now.Add(DefaultMaxExhaustion)
+	if p.AllExhausted() {
+		t.Error("still exhausted after the cap")
+	}
+}
+
+type memState struct{ m map[string]time.Time }
+
+func (s *memState) ExhaustedUntil(n string) (time.Time, error) { return s.m[n], nil }
+func (s *memState) SetExhaustedUntil(n string, t time.Time) error {
+	s.m[n] = t
+	return nil
+}

@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/DavidGodefroid/dutydesk/internal/agent"
 	"github.com/DavidGodefroid/dutydesk/internal/check"
+	"github.com/DavidGodefroid/dutydesk/internal/config"
 	"github.com/DavidGodefroid/dutydesk/internal/incident"
 	"github.com/DavidGodefroid/dutydesk/internal/model"
 	"github.com/DavidGodefroid/dutydesk/internal/store"
@@ -42,26 +45,28 @@ func replayCheck(p *model.Project, inc model.Incident) (model.Check, string, boo
 	return model.Check{}, "", false
 }
 
-// stillFiring replays the check of an incident through the locks.
-// ok is false when no answer could be had now (locks down, lock error).
-func (s *Service) stillFiring(ctx context.Context, p *model.Project, inc model.Incident, c model.Check, fp string) (firing, ok bool) {
+// replayable reports whether the check of an incident can be replayed now:
+// the locks serve and the last failed replay is old enough.
+func (s *Service) replayable(p *model.Project, inc model.Incident) bool {
 	if !s.locksServing(p) {
-		return false, false
+		return false
 	}
-	now := s.now()
 	s.mu.Lock()
-	wait := now.Before(s.retryAt[inc.ID])
-	s.mu.Unlock()
-	if wait {
-		return false, false
-	}
+	defer s.mu.Unlock()
+	return !s.now().Before(s.retryAt[inc.ID])
+}
+
+// stillFiring replays the check of an incident through the locks, with its
+// own timeout. ok is false when no answer could be had (lock error). It
+// blocks on the lock: it is only called from the replay pool.
+func (s *Service) stillFiring(ctx context.Context, p *model.Project, inc model.Incident, c model.Check, fp string) (firing, ok bool) {
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	firing, err := check.StillFiring(cctx, c, p, s.o.Reader, fp)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err != nil {
-		s.retryAt[inc.ID] = now.Add(s.periods.RecheckRetry)
+		s.retryAt[inc.ID] = s.now().Add(s.periods.RecheckRetry)
 		if ctx.Err() == nil {
 			s.log.Warn("check not replayed", "incident", inc.ID, "check", c.ID, "error", s.scrub(err.Error()))
 		}
@@ -69,6 +74,19 @@ func (s *Service) stillFiring(ctx context.Context, p *model.Project, inc model.I
 	}
 	delete(s.retryAt, inc.ID)
 	return firing, true
+}
+
+// replay runs the check of an incident in the bounded replay pool and hands
+// the answer to then. The main loop never waits for a lock.
+func (s *Service) replay(ctx context.Context, p *model.Project, inc model.Incident, c model.Check, fp string, then func(firing bool)) {
+	if !s.replayable(p, inc) {
+		return
+	}
+	s.background(ctx, s.replaySem, "replay:"+inc.ID, func(ctx context.Context) {
+		if firing, answered := s.stillFiring(ctx, p, inc, c, fp); answered {
+			then(firing)
+		}
+	})
 }
 
 // rechecks handles the waiting incidents whose wake-up time has come: the
@@ -88,21 +106,22 @@ func (s *Service) rechecks(ctx context.Context) {
 		if p == nil {
 			continue
 		}
-		firing := true
-		if c, fp, ok := replayCheck(p, inc); ok {
-			var answered bool
-			if firing, answered = s.stillFiring(ctx, p, inc, c, fp); !answered {
-				continue // try again later; the incident stays waiting
+		apply := func(firing bool) {
+			tr, err := s.mgr.Recheck(inc, firing)
+			if err != nil && !errors.Is(err, incident.ErrDossier) {
+				if !errors.Is(err, store.ErrStateConflict) {
+					s.log.Error("recheck not applied", "incident", inc.ID, "error", err)
+				}
+				return
 			}
+			s.log.Info("recheck", "incident", inc.ID, "still_firing", firing, "to", string(tr.To))
+			s.Kick()
 		}
-		tr, err := s.mgr.Recheck(inc, firing)
-		if err != nil && !errors.Is(err, incident.ErrDossier) {
-			if !errors.Is(err, store.ErrStateConflict) {
-				s.log.Error("recheck not applied", "incident", inc.ID, "error", err)
-			}
+		if c, fp, ok := replayCheck(p, inc); ok {
+			s.replay(ctx, p, inc, c, fp, apply) // unanswered: the incident stays waiting
 			continue
 		}
-		s.log.Info("recheck", "incident", inc.ID, "still_firing", firing, "to", string(tr.To))
+		apply(true) // no check to replay: a new pass
 	}
 }
 
@@ -127,23 +146,25 @@ func (s *Service) clearedConditions(ctx context.Context) {
 		if !ok {
 			continue
 		}
-		firing, answered := s.stillFiring(ctx, p, inc, c, fp)
-		if !answered || firing {
-			continue
-		}
-		if _, err := s.mgr.Recheck(inc, false); err != nil && !errors.Is(err, incident.ErrDossier) {
-			if !errors.Is(err, store.ErrStateConflict) {
-				s.log.Error("cleared incident not closed", "incident", inc.ID, "error", err)
+		s.replay(ctx, p, inc, c, fp, func(firing bool) {
+			if firing {
+				return
 			}
-			continue
-		}
-		s.log.Info("incident closed: condition cleared", "incident", inc.ID, "was", string(inc.State))
+			if _, err := s.mgr.Recheck(inc, false); err != nil && !errors.Is(err, incident.ErrDossier) {
+				if !errors.Is(err, store.ErrStateConflict) {
+					s.log.Error("cleared incident not closed", "incident", inc.ID, "error", err)
+				}
+				return
+			}
+			s.log.Info("incident closed: condition cleared", "incident", inc.ID, "was", string(inc.State))
+		})
 	}
 }
 
 // greenLights follows the tickets of incidents waiting for a human decision
 // and enforces the runbook's patience: past GreenLightTimeout the ticket is
-// withdrawn and the incident escalated.
+// withdrawn and the incident escalated. The hub is asked outside the main
+// loop.
 func (s *Service) greenLights(ctx context.Context) {
 	waiting, err := s.st.ListIncidents(store.IncidentFilter{States: []model.IncidentState{model.StateGreenLight}})
 	if err != nil {
@@ -151,53 +172,149 @@ func (s *Service) greenLights(ctx context.Context) {
 		return
 	}
 	for _, inc := range waiting {
-		if ctx.Err() != nil {
+		if p := s.Project(inc.Project); p != nil {
+			s.background(ctx, s.ioSem, "ticket:"+inc.ID, func(ctx context.Context) { s.followTicket(ctx, p, inc) })
+		}
+	}
+}
+
+func (s *Service) followTicket(ctx context.Context, p *model.Project, inc model.Incident) {
+	state := model.TicketUnknown
+	if inc.Ticket != "" {
+		tctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		st, err := s.o.Status.Ticket(tctx, p.Locks.Workspace, inc.Ticket)
+		cancel()
+		if err != nil {
+			s.log.Warn("ticket state not read", "incident", inc.ID, "error", err)
+		} else {
+			state = st
+		}
+	}
+	var tr incident.Transition
+	var err error
+	switch state {
+	case model.TicketPending, model.TicketUnknown:
+		since, serr := s.st.StateSince(inc.ID)
+		if serr != nil || p.Limits.GreenLightTimeout <= 0 || s.now().Sub(since) < p.Limits.GreenLightTimeout {
 			return
 		}
-		p := s.Project(inc.Project)
-		if p == nil {
+		tr, err = s.mgr.GreenLightTimedOut(inc)
+	default:
+		tr, err = s.mgr.GreenLightDecided(inc, state)
+	}
+	if err != nil && !errors.Is(err, incident.ErrDossier) {
+		if !errors.Is(err, store.ErrStateConflict) {
+			s.log.Error("ticket decision not applied", "incident", inc.ID, "error", err)
+		}
+		return
+	}
+	s.log.Info("green light", "incident", inc.ID, "ticket_state", string(state), "to", string(tr.To))
+	// The escalation alert and the withdrawal are owed in the outbox.
+	s.kickOutbox(store.EffectTransition)
+	if tr.To == model.StateQueued {
+		s.Kick()
+	}
+}
+
+// ageLimits escalates the queued and waiting incidents that reached the
+// maximum incident age: the limit is a timer, not only a test made when a
+// verdict comes.
+func (s *Service) ageLimits() {
+	now := s.now()
+	for _, p := range s.cfg.Load().Projects {
+		if p.Limits.MaxIncidentAge <= 0 {
 			continue
 		}
-		state := model.TicketUnknown
-		if inc.Ticket != "" {
-			tctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-			st, err := s.o.Status.Ticket(tctx, p.Locks.Workspace, inc.Ticket)
-			cancel()
-			if err != nil {
-				s.log.Warn("ticket state not read", "incident", inc.ID, "error", err)
-			} else {
-				state = st
-			}
+		old, err := s.st.IncidentsPastAge(p.Slug, now.Add(-p.Limits.MaxIncidentAge))
+		if err != nil {
+			s.log.Error("old incidents not read", "project", p.Slug, "error", err)
+			continue
 		}
-		var tr incident.Transition
-		switch state {
-		case model.TicketPending, model.TicketUnknown:
-			since, err := s.st.StateSince(inc.ID)
-			if err != nil || p.Limits.GreenLightTimeout <= 0 || s.now().Sub(since) < p.Limits.GreenLightTimeout {
-				continue
-			}
-			tr, err = s.mgr.GreenLightTimedOut(inc)
+		for _, inc := range old {
+			tr, err := s.mgr.AgeOut(inc, p.Limits)
 			if err != nil && !errors.Is(err, incident.ErrDossier) {
-				s.log.Error("green-light timeout not applied", "incident", inc.ID, "error", err)
+				if !errors.Is(err, store.ErrStateConflict) {
+					s.log.Error("old incident not escalated", "incident", inc.ID, "error", err)
+				}
 				continue
 			}
-			s.withdraw(ctx, p, tr.WithdrawTicket)
-		default:
-			tr, err = s.mgr.GreenLightDecided(inc, state)
-			if err != nil && !errors.Is(err, incident.ErrDossier) {
-				s.log.Error("ticket decision not applied", "incident", inc.ID, "error", err)
-				continue
+			if tr.Changed() {
+				s.log.Warn("incident escalated: maximum age reached", "incident", inc.ID, "was", string(tr.From))
+				s.kickOutbox(store.EffectTransition)
 			}
 		}
-		s.log.Info("green light", "incident", inc.ID, "ticket_state", string(state), "to", string(tr.To))
-		if tr.Alert == model.AlertEscalated {
-			s.alertIncident(ctx, p, tr.Incident, model.AlertEscalated, "Escalated: "+tr.Incident.Summary,
-				"The sensitive action the agent asked for did not get a green light ("+tr.Reason+
-					"). Nothing was run. A human must take over; `dutydesk incident show "+inc.ID+"` has the diagnosis.", "")
+	}
+}
+
+// seatsExhausted alerts, once per episode and whatever the severity of
+// what waits, when every seat is out of quota: nothing can be investigated.
+func (s *Service) seatsExhausted() {
+	all := s.pool.AllExhausted()
+	s.mu.Lock()
+	was := s.seatsOut
+	s.seatsOut = all
+	s.mu.Unlock()
+	if !all || was {
+		return
+	}
+	var lines []string
+	for _, st := range s.pool.Stats() {
+		lines = append(lines, fmt.Sprintf("%s: quota exhausted until %s", st.Name, st.ExhaustedUntil.UTC().Format("2006-01-02 15:04 UTC")))
+	}
+	s.systemAlert(model.Alert{Kind: model.AlertCapacity,
+		Title: "Every seat is out of quota: no agent can run",
+		Body: strings.Join(lines, "\n") + "\nIncidents wait in the queue until a seat is back. " +
+			"If the seats were not really used up, look at the last passes (`dutydesk seats`, `dutydesk incidents`)."})
+}
+
+// retention prunes what resolved incidents leave behind: the transcripts of
+// their passes first, then their dossier and their rows.
+func (s *Service) retention() {
+	now := s.now()
+	keepT, keepI := s.d.Retention.Transcripts, s.d.Retention.Incidents
+	if keepT <= 0 {
+		keepT = config.DefaultRetentionTranscripts
+	}
+	if keepI <= 0 {
+		keepI = config.DefaultRetentionIncidents
+	}
+	if ids, err := s.st.ResolvedBefore(now.Add(-keepI), 500); err == nil {
+		for _, id := range ids {
+			dir, derr := s.dossier.Dir(id)
+			if derr != nil {
+				continue
+			}
+			if err := s.st.DeleteIncident(id); err != nil {
+				if !errors.Is(err, store.ErrStateConflict) {
+					s.log.Warn("old incident not pruned", "incident", id, "error", err)
+				}
+				continue
+			}
+			if err := os.RemoveAll(dir); err != nil {
+				s.log.Warn("old dossier not removed", "incident", id, "error", err)
+			}
+			s.log.Info("resolved incident pruned", "incident", id)
 		}
-		if tr.To == model.StateQueued {
-			s.Kick()
+	}
+	if ids, err := s.st.ResolvedBefore(now.Add(-keepT), 5000); err == nil {
+		for _, id := range ids {
+			dir, derr := s.dossier.Dir(id)
+			if derr != nil {
+				continue
+			}
+			runs := filepath.Join(dir, "runs")
+			if entries, err := os.ReadDir(runs); err != nil || len(entries) == 0 {
+				continue
+			}
+			if err := os.RemoveAll(runs); err != nil {
+				s.log.Warn("old transcripts not removed", "incident", id, "error", err)
+				continue
+			}
+			s.journal(id, "transcripts pruned", fmt.Sprintf("The transcripts of the passes were removed %s after the incident was resolved (retention).", keepT))
 		}
+	}
+	if err := s.st.PruneEffects(now.Add(-keepT)); err != nil {
+		s.log.Warn("finished effects not pruned", "error", err)
 	}
 }
 
@@ -264,8 +381,21 @@ func (s *Service) knownProblems(ctx context.Context) {
 	}
 }
 
-// reminders re-alerts for incidents that still wait for a human.
-func (s *Service) reminders(ctx context.Context) {
+// reminders re-alerts for incidents that still wait for a human. The delay
+// runs from the last alert that was DELIVERED; while an alert for the
+// incident still waits in the outbox, no reminder is piled on top of it.
+func (s *Service) reminders() {
+	// What is owed is read first: an alert delivered after this point has
+	// moved the last-alert time by the time the due list is read.
+	owed, err := s.st.PendingEffects("")
+	if err != nil {
+		s.log.Error("outbox not read", "error", err)
+		return
+	}
+	pending := map[string]bool{}
+	for _, e := range owed {
+		pending[e.Incident] = true
+	}
 	due, err := s.mgr.DueReminders()
 	if err != nil {
 		s.log.Error("reminders not read", "error", err)
@@ -273,7 +403,7 @@ func (s *Service) reminders(ctx context.Context) {
 	}
 	for _, inc := range due {
 		p := s.Project(inc.Project)
-		if p == nil {
+		if p == nil || pending[inc.ID] {
 			continue
 		}
 		what := map[model.IncidentState]string{
@@ -281,14 +411,14 @@ func (s *Service) reminders(ctx context.Context) {
 			model.StateBlocked:    "is blocked: an action is missing from the catalogue",
 			model.StateGreenLight: "waits for a green light on ticket " + inc.Ticket,
 		}[inc.State]
-		s.alertIncident(ctx, p, inc, model.AlertReminder, "Still open: "+inc.Summary,
+		s.alertIncident(p, inc, model.AlertReminder, "Still open: "+subject(p, inc),
 			fmt.Sprintf("%s %s since %s.\nTake it over, or close it once handled: dutydesk incident close %s",
 				inc.ID, what, inc.UpdatedAt.UTC().Format("2006-01-02 15:04 UTC"), inc.ID), "")
 	}
 }
 
 // seatExpiry alerts 30 days before a seat token expires, once per day.
-func (s *Service) seatExpiry(ctx context.Context) {
+func (s *Service) seatExpiry() {
 	today := s.now().UTC().Format("2006-01-02")
 	for _, st := range s.pool.Expiring(30 * 24 * time.Hour) {
 		key := "seat_expiry_alert:" + st.Name
@@ -303,7 +433,7 @@ func (s *Service) seatExpiry(ctx context.Context) {
 		if days < 0 || !st.ExpiresOn.After(s.now()) {
 			title = fmt.Sprintf("The token of seat %s expired on %s", st.Name, st.ExpiresOn.Format("2006-01-02"))
 		}
-		s.systemAlert(ctx, model.Alert{Kind: model.AlertSeatExpiry, Title: title,
+		s.systemAlert(model.Alert{Kind: model.AlertSeatExpiry, Title: title,
 			Body: "Renew it with `claude setup-token` under the seat's account, replace the token file (mode 0600) and update expires_on in dutydesk.yaml."})
 	}
 }

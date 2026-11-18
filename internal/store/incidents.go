@@ -12,7 +12,7 @@ import (
 
 const incidentCols = `id, project, source, fingerprint, family, severity, summary, state, mass, recurrent,
 	runbook, signal_count, runs, agent_token, ticket, recheck_at, opened_at, updated_at, closed_at,
-	last_alert_at, close_reason`
+	last_alert_at, close_reason, green_lights, quota_runs, age_from`
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -24,11 +24,12 @@ func scanIncident(sc scanner) (model.Incident, error) {
 		state                                       string
 		mass, recurrent                             int
 		recheck, opened, updated, closed, lastAlert string
+		ageFrom                                     string
 		sev                                         int
 	)
 	err := sc.Scan(&i.ID, &i.Project, &i.Source, &i.Fingerprint, &i.Family, &sev, &i.Summary, &state, &mass, &recurrent,
 		&i.Runbook, &i.SignalCount, &i.Runs, &i.AgentToken, &i.Ticket, &recheck, &opened, &updated, &closed,
-		&lastAlert, &i.CloseReason)
+		&lastAlert, &i.CloseReason, &i.GreenLights, &i.QuotaRuns, &ageFrom)
 	if err != nil {
 		return i, err
 	}
@@ -41,6 +42,7 @@ func scanIncident(sc scanner) (model.Incident, error) {
 	i.UpdatedAt = parseTime(updated)
 	i.ClosedAt = parseTime(closed)
 	i.LastAlertAt = parseTime(lastAlert)
+	i.AgeFrom = parseTime(ageFrom)
 	return i, nil
 }
 
@@ -70,6 +72,56 @@ func isUniqueViolation(err error) bool {
 // store; State defaults to queued. It returns ErrDuplicateOpen when an open
 // incident already has the same project and fingerprint.
 func (s *Store) CreateIncident(inc model.Incident) (model.Incident, error) {
+	err := s.tx(func(tx *sql.Tx) error {
+		var err error
+		inc, err = s.createIncident(tx, inc)
+		return err
+	})
+	return inc, createErr(err)
+}
+
+// OpenIncident creates an incident with its origin signal and the effects
+// its creation owes (a storm or recurrence alert), in one transaction: a
+// crash leaves either all of it or nothing. The effects get the incident's
+// id and project.
+func (s *Store) OpenIncident(inc model.Incident, sig model.Signal, owed ...Effect) (model.Incident, error) {
+	err := s.tx(func(tx *sql.Tx) error {
+		var err error
+		if inc, err = s.createIncident(tx, inc); err != nil {
+			return err
+		}
+		id, err := insertSignal(tx, sig, s.signalTime(sig))
+		if err != nil {
+			return err
+		}
+		if err := attachSignal(tx, id, inc.ID, s.now()); err != nil {
+			return err
+		}
+		for _, e := range owed {
+			e.Incident, e.Project = inc.ID, inc.Project
+			if _, err := s.enqueue(tx, e); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return model.Incident{}, createErr(err)
+	}
+	return s.GetIncident(inc.ID)
+}
+
+func createErr(err error) error {
+	if isUniqueViolation(err) {
+		return ErrDuplicateOpen
+	}
+	if err != nil {
+		return fmt.Errorf("store: create incident: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) createIncident(tx *sql.Tx, inc model.Incident) (model.Incident, error) {
 	now := s.now()
 	if inc.State == "" {
 		inc.State = model.StateQueued
@@ -85,28 +137,20 @@ func (s *Store) CreateIncident(inc model.Incident) (model.Incident, error) {
 	inc.RecheckAt = normTime(inc.RecheckAt)
 	inc.ClosedAt = normTime(inc.ClosedAt)
 	inc.LastAlertAt = normTime(inc.LastAlertAt)
-	err := s.tx(func(tx *sql.Tx) error {
-		var seq int64
-		if err := tx.QueryRow(`SELECT COALESCE(MAX(seq), 0) + 1 FROM incidents`).Scan(&seq); err != nil {
-			return err
-		}
-		inc.ID = fmt.Sprintf("INC-%06d", seq)
-		_, err := tx.Exec(`INSERT INTO incidents (seq, `+incidentCols+`, state_since)
-			VALUES (?, ?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?, ?,?, ?)`,
-			seq, inc.ID, inc.Project, inc.Source, inc.Fingerprint, inc.Family, int(inc.Severity), inc.Summary,
-			string(inc.State), boolInt(inc.Mass), boolInt(inc.Recurrent),
-			inc.Runbook, inc.SignalCount, inc.Runs, inc.AgentToken, inc.Ticket, fmtTime(inc.RecheckAt),
-			fmtTime(inc.OpenedAt), fmtTime(inc.UpdatedAt), fmtTime(inc.ClosedAt),
-			fmtTime(inc.LastAlertAt), inc.CloseReason, fmtTime(now))
-		return err
-	})
-	if isUniqueViolation(err) {
-		return model.Incident{}, ErrDuplicateOpen
+	inc.AgeFrom = normTime(inc.AgeFrom)
+	var seq int64
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(seq), 0) + 1 FROM incidents`).Scan(&seq); err != nil {
+		return inc, err
 	}
-	if err != nil {
-		return model.Incident{}, fmt.Errorf("store: create incident: %w", err)
-	}
-	return inc, nil
+	inc.ID = fmt.Sprintf("INC-%06d", seq)
+	_, err := tx.Exec(`INSERT INTO incidents (seq, `+incidentCols+`, state_since)
+		VALUES (?, ?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?, ?,?, ?,?,?, ?)`,
+		seq, inc.ID, inc.Project, inc.Source, inc.Fingerprint, inc.Family, int(inc.Severity), inc.Summary,
+		string(inc.State), boolInt(inc.Mass), boolInt(inc.Recurrent),
+		inc.Runbook, inc.SignalCount, inc.Runs, inc.AgentToken, inc.Ticket, fmtTime(inc.RecheckAt),
+		fmtTime(inc.OpenedAt), fmtTime(inc.UpdatedAt), fmtTime(inc.ClosedAt),
+		fmtTime(inc.LastAlertAt), inc.CloseReason, inc.GreenLights, inc.QuotaRuns, fmtTime(inc.AgeFrom), fmtTime(now))
+	return inc, err
 }
 
 func normTime(t time.Time) time.Time {
@@ -163,14 +207,65 @@ func (s *Store) ListIncidents(f IncidentFilter) ([]model.Incident, error) {
 	return s.queryIncidents(q, args...)
 }
 
+// Tx is the write transaction of an incident transition: what must be
+// stored together with the new state (owed effects, the ownership of a
+// ticket, the failure counter).
+type Tx struct {
+	s  *Store
+	tx *sql.Tx
+}
+
+// Enqueue stores an owed effect in the transaction of the transition.
+func (t *Tx) Enqueue(e Effect) error {
+	_, err := t.s.enqueue(t.tx, e)
+	return err
+}
+
+// ClaimTicket records that the incident holds the green-light ticket. It
+// returns false when the ticket was already recorded, by this incident or
+// by another one: a ticket is accepted once.
+func (t *Tx) ClaimTicket(ticket, incidentID string) (bool, error) {
+	res, err := t.tx.Exec(`INSERT INTO tickets (ticket, incident_id, at) VALUES (?, ?, ?)
+		ON CONFLICT(ticket) DO NOTHING`, ticket, incidentID, fmtTime(t.s.now()))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// IncrementFailures adds one to the consecutive failed-run counter.
+func (t *Tx) IncrementFailures(id string) (int, error) {
+	var n int
+	err := t.tx.QueryRow(`UPDATE incidents SET failures = failures + 1 WHERE id = ? RETURNING failures`, id).Scan(&n)
+	return n, err
+}
+
+// ResetFailures clears the consecutive failed-run counter.
+func (t *Tx) ResetFailures(id string) error {
+	_, err := t.tx.Exec(`UPDATE incidents SET failures = 0 WHERE id = ?`, id)
+	return err
+}
+
 // UpdateIncident atomically loads the incident, checks that its state is one
 // of from (any state when from is empty), applies mutate and saves the
 // result. The store maintains UpdatedAt, the state timestamp and ClosedAt
 // (set when the incident becomes resolved, cleared when it leaves resolved);
-// the identity fields (ID, Project, Source, Fingerprint, OpenedAt) and
-// SignalCount cannot be changed here. It returns ErrNotFound,
+// the identity fields (ID, Project, Source, Fingerprint, OpenedAt),
+// SignalCount and LastAlertAt cannot be changed here. It returns ErrNotFound,
 // ErrStateConflict, or the error mutate returned (nothing is saved then).
 func (s *Store) UpdateIncident(id string, from []model.IncidentState, mutate func(*model.Incident) error) (model.Incident, error) {
+	return s.Transition(id, from, func(_ *Tx, i *model.Incident) error {
+		if mutate == nil {
+			return nil
+		}
+		return mutate(i)
+	})
+}
+
+// Transition is UpdateIncident with access to the transaction, so that the
+// effects a transition owes are stored with it or not at all.
+func (s *Store) Transition(id string, from []model.IncidentState, mutate func(*Tx, *model.Incident) error) (model.Incident, error) {
 	var out model.Incident
 	err := s.tx(func(tx *sql.Tx) error {
 		cur, err := scanIncident(tx.QueryRow(`SELECT `+incidentCols+` FROM incidents WHERE id = ?`, id))
@@ -194,7 +289,7 @@ func (s *Store) UpdateIncident(id string, from []model.IncidentState, mutate fun
 		}
 		next := cur
 		if mutate != nil {
-			if err := mutate(&next); err != nil {
+			if err := mutate(&Tx{s: s, tx: tx}, &next); err != nil {
 				return err
 			}
 		}
@@ -203,7 +298,7 @@ func (s *Store) UpdateIncident(id string, from []model.IncidentState, mutate fun
 		next.OpenedAt, next.SignalCount = cur.OpenedAt, cur.SignalCount
 		next.UpdatedAt = now
 		next.RecheckAt = normTime(next.RecheckAt)
-		next.LastAlertAt = normTime(next.LastAlertAt)
+		next.AgeFrom = normTime(next.AgeFrom)
 		next.ClosedAt = normTime(next.ClosedAt)
 		switch {
 		case next.State == model.StateResolved && next.ClosedAt.IsZero():
@@ -215,20 +310,25 @@ func (s *Store) UpdateIncident(id string, from []model.IncidentState, mutate fun
 		if next.State != cur.State {
 			since = fmtTime(now)
 		}
+		// last_alert_at and signal_count are owned by other writers (the
+		// delivery of an alert, the attachment of a signal): they are not
+		// written back here.
 		_, err = tx.Exec(`UPDATE incidents SET family = ?, severity = ?, summary = ?, state = ?, mass = ?,
 			recurrent = ?, runbook = ?, runs = ?, agent_token = ?, ticket = ?, recheck_at = ?, updated_at = ?,
-			closed_at = ?, last_alert_at = ?, close_reason = ?,
+			closed_at = ?, close_reason = ?, green_lights = ?, quota_runs = ?, age_from = ?,
 			state_since = CASE WHEN ? <> '' THEN ? ELSE state_since END
 			WHERE id = ?`,
 			next.Family, int(next.Severity), next.Summary, string(next.State), boolInt(next.Mass),
 			boolInt(next.Recurrent), next.Runbook, next.Runs, next.AgentToken, next.Ticket, fmtTime(next.RecheckAt),
-			fmtTime(next.UpdatedAt), fmtTime(next.ClosedAt), fmtTime(next.LastAlertAt), next.CloseReason,
+			fmtTime(next.UpdatedAt), fmtTime(next.ClosedAt), next.CloseReason,
+			next.GreenLights, next.QuotaRuns, fmtTime(next.AgeFrom),
 			since, since, id)
 		if isUniqueViolation(err) {
 			// Reopening a resolved incident while another one is open
 			// for the same fingerprint.
 			return ErrDuplicateOpen
 		}
+		next.LastAlertAt = cur.LastAlertAt
 		out = next
 		return err
 	})
@@ -288,8 +388,8 @@ func (s *Store) DueRechecks() ([]model.Incident, error) {
 
 // IncidentsNeedingReminder returns the incidents of a project ("" = all)
 // that wait for a human (escalated, blocked, green_light) and whose last
-// alert (or, when none was recorded, entry into the state) is at or before
-// notAlertedSince.
+// delivered alert (or, when none was delivered, entry into the state) is at
+// or before notAlertedSince.
 func (s *Store) IncidentsNeedingReminder(project string, notAlertedSince time.Time) ([]model.Incident, error) {
 	return s.queryIncidents(`SELECT `+incidentCols+` FROM incidents
 		WHERE state IN ('escalated', 'blocked', 'green_light') AND (? = '' OR project = ?)
@@ -453,4 +553,82 @@ func (s *Store) RecoverInterrupted() ([]model.Incident, error) {
 		args[i] = id
 	}
 	return s.queryIncidents(`SELECT `+incidentCols+` FROM incidents WHERE id IN (`+placeholders(len(ids))+`) ORDER BY seq`, args...)
+}
+
+// IncidentsPastAge returns the queued and waiting incidents of a project
+// whose age limit started at or before the given time: they are escalated
+// by a timer, not only when a verdict comes.
+func (s *Store) IncidentsPastAge(project string, startedBefore time.Time) ([]model.Incident, error) {
+	return s.queryIncidents(`SELECT `+incidentCols+` FROM incidents
+		WHERE project = ? AND state IN ('queued', 'waiting') AND mass = 0
+		AND CASE WHEN age_from > opened_at THEN age_from ELSE opened_at END <= ?
+		ORDER BY seq ASC`, project, fmtTime(startedBefore))
+}
+
+// TicketHolder returns the incident a green-light ticket was recorded for
+// ("" when the ticket was never accepted).
+func (s *Store) TicketHolder(ticket string) (string, error) {
+	var id string
+	err := s.db.QueryRow(`SELECT incident_id FROM tickets WHERE ticket = ?`, ticket).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
+}
+
+// ResolvedBefore returns the ids of the resolved incidents closed at or
+// before the given time, oldest first (retention).
+func (s *Store) ResolvedBefore(closedBefore time.Time, limit int) ([]string, error) {
+	rows, err := s.db.Query(`SELECT id FROM incidents WHERE state = 'resolved' AND closed_at <> '' AND closed_at <= ?
+		ORDER BY seq ASC LIMIT ?`, fmtTime(closedBefore), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// DeleteIncident removes a resolved incident and everything that hangs on
+// it (signals, runs, actions, alerts, tickets, finished effects). It refuses
+// an incident that is still open or still has a pending effect.
+func (s *Store) DeleteIncident(id string) error {
+	return s.tx(func(tx *sql.Tx) error {
+		var state string
+		err := tx.QueryRow(`SELECT state FROM incidents WHERE id = ?`, id).Scan(&state)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if state != string(model.StateResolved) {
+			return fmt.Errorf("%w: %s is %s", ErrStateConflict, id, state)
+		}
+		var pending int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM outbox WHERE incident = ? AND state = 'pending'`, id).Scan(&pending); err != nil {
+			return err
+		}
+		if pending > 0 {
+			return fmt.Errorf("%w: %s still has pending effects", ErrStateConflict, id)
+		}
+		for _, q := range []string{
+			`DELETE FROM signals WHERE incident_id = ?`, `DELETE FROM runs WHERE incident_id = ?`,
+			`DELETE FROM actions WHERE incident_id = ?`, `DELETE FROM alerts WHERE incident = ?`,
+			`DELETE FROM tickets WHERE incident_id = ?`, `DELETE FROM outbox WHERE incident = ?`,
+			`DELETE FROM incidents WHERE id = ?`,
+		} {
+			if _, err := tx.Exec(q, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }

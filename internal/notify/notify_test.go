@@ -331,3 +331,24 @@ func TestMultiAndRecorder(t *testing.T) {
 		t.Fatal("reset")
 	}
 }
+
+// Finding 8: agent or signal text in an alert cannot carry links, images,
+// HTML or control characters.
+func TestFormatNeutralisesUntrustedText(t *testing.T) {
+	evil := "see [approve here](https://evil.example/a) ![x](http://evil.example/p.png) <img src=x> <at>all</at>\x1b[31m\r\n[ref]: http://evil.example"
+	title, text := Format(model.Alert{Kind: model.AlertEscalated, Project: "docflow", Incident: "INC-000001",
+		Title: "t " + evil, Body: evil, URL: "https://gitlab.example.com/acme/docflow/-/merge_requests/1"})
+	for _, s := range []string{title, strings.TrimSuffix(text, "https://gitlab.example.com/acme/docflow/-/merge_requests/1")} {
+		for _, bad := range []string{"](", "![", "<", ">", "://", "\x1b", "\r", "]:"} {
+			if strings.Contains(s, bad) {
+				t.Errorf("%q survives in %q", bad, s)
+			}
+		}
+	}
+	if strings.Contains(title, "\n") {
+		t.Errorf("title on several lines: %q", title)
+	}
+	if !strings.HasSuffix(text, "https://gitlab.example.com/acme/docflow/-/merge_requests/1") {
+		t.Errorf("the core's own URL is lost: %q", text)
+	}
+}

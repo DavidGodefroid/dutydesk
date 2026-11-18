@@ -19,6 +19,15 @@ import (
 // of its quota is unknown.
 const DefaultExhaustion = time.Hour
 
+// MaxExhaustion is the hard ceiling of the time a seat may be marked
+// exhausted, whatever reset time a pass reported: the report comes from the
+// output of an untrusted agent container, and a forged one must not take a
+// seat out for weeks.
+const MaxExhaustion = 24 * time.Hour
+
+// DefaultMaxExhaustion is the ceiling when none is configured.
+const DefaultMaxExhaustion = 5 * time.Hour
+
 // StateStore persists the exhaustion of seats across restarts.
 type StateStore interface {
 	// ExhaustedUntil returns the zero time for a seat that is not exhausted
@@ -54,6 +63,17 @@ type Pool struct {
 	seats []*entry // declaration order
 	byNam map[string]*entry
 	seq   uint64
+	cap   time.Duration // longest exhaustion
+}
+
+// WithMaxExhaustion sets the longest time a seat may be marked exhausted
+// (default DefaultMaxExhaustion, never above MaxExhaustion).
+func WithMaxExhaustion(d time.Duration) Option {
+	return func(p *Pool) {
+		if d > 0 {
+			p.cap = d
+		}
+	}
 }
 
 // Option configures a Pool.
@@ -67,9 +87,12 @@ func WithClock(now func() time.Time) Option {
 // New builds a pool. store may be nil (exhaustion is then kept in memory
 // only). MaxParallel below 1 means 1.
 func New(seats []model.Seat, store StateStore, opts ...Option) (*Pool, error) {
-	p := &Pool{now: time.Now, store: store, byNam: make(map[string]*entry, len(seats))}
+	p := &Pool{now: time.Now, store: store, byNam: make(map[string]*entry, len(seats)), cap: DefaultMaxExhaustion}
 	for _, o := range opts {
 		o(p)
+	}
+	if p.cap > MaxExhaustion {
+		p.cap = MaxExhaustion
 	}
 	for _, s := range seats {
 		if s.Name == "" {
@@ -86,6 +109,11 @@ func New(seats []model.Seat, store StateStore, opts ...Option) (*Pool, error) {
 			until, err := store.ExhaustedUntil(s.Name)
 			if err != nil {
 				return nil, fmt.Errorf("seat %s: read state: %w", s.Name, err)
+			}
+			// A mark saved before the cap existed (or under a larger cap)
+			// is cut down too.
+			if limit := p.now().Add(p.cap); until.After(limit) {
+				until = limit
 			}
 			e.exhaustedUntil = until
 		}
@@ -133,8 +161,9 @@ func (p *Pool) Acquire(allowed []string) (model.Seat, func(), bool) {
 }
 
 // MarkExhausted makes a seat unavailable until the given time; a zero time
-// (reset unknown) or a time in the past means now + DefaultExhaustion. The
-// seat is marked in memory even when the store fails.
+// (reset unknown) or a time in the past means now + DefaultExhaustion, and
+// no mark goes beyond now + the cap (WithMaxExhaustion). The seat is marked
+// in memory even when the store fails.
 func (p *Pool) MarkExhausted(name string, until time.Time) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -145,6 +174,9 @@ func (p *Pool) MarkExhausted(name string, until time.Time) error {
 	now := p.now()
 	if !until.After(now) {
 		until = now.Add(DefaultExhaustion)
+	}
+	if limit := now.Add(p.cap); until.After(limit) {
+		until = limit
 	}
 	e.exhaustedUntil = until
 	if p.store != nil {
@@ -245,6 +277,19 @@ func (p *Pool) Stats() []Stat {
 		out = append(out, s)
 	}
 	return out
+}
+
+// AllExhausted reports whether every seat of the pool is out of quota.
+func (p *Pool) AllExhausted() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.now()
+	for _, e := range p.seats {
+		if !now.Before(e.exhaustedUntil) {
+			return false
+		}
+	}
+	return len(p.seats) > 0
 }
 
 func contains(list []string, s string) bool {

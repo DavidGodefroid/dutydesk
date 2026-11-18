@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strings"
@@ -49,7 +50,7 @@ var builtinPatterns = []pattern{
 	},
 }
 
-// scanner looks for literal secrets (and their base64 forms) and for the
+// scanner looks for literal secrets (and their encoded forms) and for the
 // built-in patterns. It reports where, never what.
 type scanner struct {
 	needles  [][]byte
@@ -74,11 +75,17 @@ func newScanner(secrets []string) *scanner {
 	return s
 }
 
-// secretForms returns the secret and the base64 strings that contain it at
-// each of the three byte alignments, in both alphabets, without the edge
-// characters that depend on neighbouring bytes.
+// secretForms returns the secret, the secret reversed, its hexadecimal form in
+// lower and upper case, and the base64 strings that contain it at each of the
+// three byte alignments, in both alphabets, without the edge characters that
+// depend on neighbouring bytes. It is a best-effort list, not an exhaustive one.
 func secretForms(sec []byte) [][]byte {
-	forms := [][]byte{sec}
+	rev := make([]byte, len(sec))
+	for i, b := range sec {
+		rev[len(sec)-1-i] = b
+	}
+	low := []byte(hex.EncodeToString(sec))
+	forms := [][]byte{sec, rev, low, bytes.ToUpper(low)}
 	skip := [3]int{0, 2, 3}
 	for _, enc := range []*base64.Encoding{base64.RawStdEncoding, base64.RawURLEncoding} {
 		for off := 0; off < 3; off++ {

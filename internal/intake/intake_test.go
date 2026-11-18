@@ -40,10 +40,14 @@ type rig struct {
 	signals  []model.Signal
 	resolved []string
 	logs     bytes.Buffer
+	now      time.Time
 }
 
-func newRig(t *testing.T) *rig {
-	r := &rig{t: t}
+func newRig(t *testing.T) *rig { return newRigWith(t, nil) }
+
+// newRigWith lets a test change the options before the handler is built.
+func newRigWith(t *testing.T, tune func(*Options)) *rig {
+	r := &rig{t: t, now: at}
 	p := &model.Project{Slug: "shop", Webhooks: map[string]model.Webhook{
 		"sentry": {Kind: "sentry", SecretFile: "/secrets/sentry", Severity: model.SevHigh},
 		"queue": {Kind: "generic", SecretFile: "/secrets/generic", Severity: model.SevMedium,
@@ -57,7 +61,7 @@ func newRig(t *testing.T) *rig {
 		"empty":   {Kind: "generic", SecretFile: "/secrets/empty", FingerprintTemplate: "x"},
 		"strange": {Kind: "pagerduty", SecretFile: "/secrets/generic"},
 	}}
-	h, err := New(Options{
+	o := Options{
 		Project: func(slug string) *model.Project {
 			if slug == "shop" {
 				return p
@@ -77,9 +81,13 @@ func newRig(t *testing.T) *rig {
 			}
 			return nil, os.ErrNotExist
 		},
-		Now:    func() time.Time { return at },
+		Now:    func() time.Time { return r.now },
 		Logger: slog.New(slog.NewTextHandler(&r.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
-	})
+	}
+	if tune != nil {
+		tune(&o)
+	}
+	h, err := New(o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +148,7 @@ func TestSentryIssueCreated(t *testing.T) {
 	}
 	want := []model.Signal{{
 		Project: "shop", Source: "sentry", Fingerprint: "sentry:4509877862", Severity: model.SevHigh,
-		Summary: `Sentry error: App\Exception\RenderException in App\Service\InvoiceRenderer::render (SHOP-API-3F)`,
+		Summary: "Sentry sentry: issue 4509877862",
 		Fields: map[string]string{
 			"issue_id": "4509877862", "project": "shop-api", "short_id": "SHOP-API-3F",
 			"exception_type": `App\Exception\RenderException`, "culprit": `App\Service\InvoiceRenderer::render`,
@@ -169,7 +177,7 @@ func TestSentryEventAlert(t *testing.T) {
 	}
 	s := r.signals[0]
 	if s.Fingerprint != "sentry:4509877862" || s.Severity != model.SevHigh || !s.At.Equal(at) ||
-		s.Summary != `Sentry error: App\Exception\RenderException in App\Service\InvoiceRenderer::render (issue 4509877862)` {
+		s.Summary != "Sentry sentry: issue 4509877862" {
 		t.Fatalf("signal: %+v", s)
 	}
 	f := s.Fields
@@ -239,7 +247,7 @@ func TestSentryResourceFromPayload(t *testing.T) {
 		t.Fatalf("status %d signals %v", w.Code, r.signals)
 	}
 	s := r.signals[0]
-	if s.Fingerprint != "sentry:77" || s.Summary != "Sentry fatal (issue 77)" || !reflect.DeepEqual(s.Fields, map[string]string{"issue_id": "77", "level": "fatal"}) {
+	if s.Fingerprint != "sentry:77" || s.Summary != "Sentry sentry: issue 77" || !reflect.DeepEqual(s.Fields, map[string]string{"issue_id": "77", "level": "fatal"}) {
 		t.Fatalf("signal: %+v", s)
 	}
 }
@@ -313,12 +321,12 @@ func TestGeneric(t *testing.T) {
 
 func TestGenericValuesAreCleaned(t *testing.T) {
 	r := newRig(t)
-	body, _ := json.Marshal(map[string]any{"alert": map[string]any{"labels": map[string]any{"queue": "a\nb\x1b[31m" + strings.Repeat("é", 400)}}})
+	body, _ := json.Marshal(map[string]any{"alert": map[string]any{"labels": map[string]any{"queue": "a\nb\x1b[31m" + strings.Repeat("é", 400) + strings.Repeat("z", 400)}}})
 	if w := r.post("/hooks/shop/queue", body, map[string]string{HeaderGeneric: "sha256=" + sign(genericSecret, body)}); w.Code != 202 {
 		t.Fatalf("status %d", w.Code)
 	}
 	q := r.signals[0].Fields["queue"]
-	if strings.ContainsAny(q, "\n\x1b") || len([]rune(q)) != maxValue || !strings.HasPrefix(q, "a b [31m") {
+	if len(q) != maxText || q != "a b31m"+strings.Repeat("z", maxText-6) {
 		t.Fatalf("value: %q", q)
 	}
 }

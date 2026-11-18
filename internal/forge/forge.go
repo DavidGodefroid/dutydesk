@@ -2,9 +2,13 @@
 // merge request (GitLab) or pull request (GitHub) with the service account.
 //
 // The agent edits a clone it fully controls, so nothing inside that clone is
-// trusted: Propose never reads the clone's .git directory to run anything. It
-// builds the commit in a private repository created for the call, fetches the
-// base from the URL of model.Repo and pushes to that URL only.
+// trusted: Propose never reads the clone's .git directory, neither to run
+// anything nor to learn anything. It builds the commit in a private repository
+// created for the call, on the base commit recorded by Clone (BaseOf,
+// RestoreBase), fetched from the URL of model.Repo, and pushes to that URL only.
+//
+// Propose is idempotent for a branch: called again with the same working tree
+// it neither pushes nor opens a second merge request.
 //
 // There is deliberately no merge function anywhere in this package.
 package forge
@@ -19,6 +23,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -65,6 +70,11 @@ type Limits struct {
 	MaxFiles       int // changed files, default 100
 	MaxDiffBytes   int // total size of the diff, default 512 KiB
 	MaxBinaryBytes int // size of one added or modified binary file, default 64 KiB
+
+	// Caps on the whole working tree, measured with lstat before git reads a
+	// single file. The clone's own .git directory is not counted.
+	MaxTreeFiles int   // files, links and directories, default 200000
+	MaxTreeBytes int64 // total size of the regular files, default 2 GiB
 }
 
 // Config configures a Forge. The zero value is usable.
@@ -117,6 +127,12 @@ func New(cfg Config) *Forge {
 	}
 	if cfg.Limits.MaxBinaryBytes <= 0 {
 		cfg.Limits.MaxBinaryBytes = 64 << 10
+	}
+	if cfg.Limits.MaxTreeFiles <= 0 {
+		cfg.Limits.MaxTreeFiles = 200000
+	}
+	if cfg.Limits.MaxTreeBytes <= 0 {
+		cfg.Limits.MaxTreeBytes = 2 << 30
 	}
 	if cfg.GitTimeout <= 0 {
 		cfg.GitTimeout = 2 * time.Minute
@@ -201,6 +217,40 @@ func cloneKey(dir string) (string, error) {
 	return filepath.Clean(abs), nil
 }
 
+// BaseOf returns the commit the clone in dir was made at, as recorded by Clone
+// or RestoreBase. The core stores it to call RestoreBase after a restart.
+func (f *Forge) BaseOf(dir string) (rev string, ok bool) {
+	key, err := cloneKey(dir)
+	if err != nil {
+		return "", false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	rev, ok = f.bases[key]
+	return rev, ok
+}
+
+// RestoreBase records rev as the commit the clone in dir was made at, for a
+// clone made before the daemon restarted. rev must be a full lower-case
+// hexadecimal commit id that the caller got from BaseOf and kept in its own
+// storage: never a value read from the clone, which the agent controls.
+func (f *Forge) RestoreBase(dir, rev string) error {
+	if dir == "" {
+		return errors.New("forge: no clone directory")
+	}
+	if !isHexID(rev) {
+		return errors.New("forge: the base must be a full hexadecimal commit id")
+	}
+	key, err := cloneKey(dir)
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	f.bases[key] = rev
+	f.mu.Unlock()
+	return nil
+}
+
 // Clone makes a shallow clone of the default branch in dir. The token is
 // handed to git through the environment only: the clone holds no credential
 // and its origin push URL is disabled.
@@ -259,6 +309,14 @@ type change struct {
 
 // Propose commits the working tree of dir on a new branch, pushes that single
 // branch and opens a merge request. Every refusal happens before the push.
+//
+// The base commit is the one recorded by Clone (or RestoreBase) for dir;
+// without a record Propose refuses with ErrUnknownBase.
+//
+// Calling it again for the same branch is safe: when the remote branch already
+// holds exactly this tree on this base, nothing is pushed, and an open merge
+// request of that branch is returned instead of opening a second one. A remote
+// branch with any other content is refused with ErrBranchExists.
 func (f *Forge) Propose(ctx context.Context, repo model.Repo, dir, branch, title, description string, draft bool, labels []string) (model.MRInfo, error) {
 	var none model.MRInfo
 	if !validBranch(branch) {
@@ -297,6 +355,16 @@ func (f *Forge) Propose(ctx context.Context, repo model.Repo, dir, branch, title
 	if st, err := os.Lstat(key); err != nil || !st.IsDir() {
 		return none, fmt.Errorf("forge: %s is not a directory", key)
 	}
+	f.mu.Lock()
+	base, known := f.bases[key]
+	f.mu.Unlock()
+	if !known {
+		return none, refuse(ErrUnknownBase, "no base recorded for this clone directory")
+	}
+	// Measured before git hashes anything.
+	if err := measureTree(ctx, key, f.cfg.Limits.MaxTreeFiles, f.cfg.Limits.MaxTreeBytes); err != nil {
+		return none, err
+	}
 
 	// A private repository: the clone's own .git (config, hooks, remotes,
 	// index, refs) is never used.
@@ -323,8 +391,7 @@ func (f *Forge) Propose(ctx context.Context, repo model.Repo, dir, branch, title
 	if branch == target {
 		return none, refuse(ErrBadBranch, "the default branch")
 	}
-	base, err := f.fetchBase(ctx, remote, repo.URL, target, key)
-	if err != nil {
+	if err := f.fetchBase(ctx, remote, repo.URL, target, base); err != nil {
 		return none, err
 	}
 
@@ -343,7 +410,7 @@ func (f *Forge) Propose(ctx context.Context, repo model.Repo, dir, branch, title
 	}
 
 	// Paths: nothing under a .git directory, no nested repository, no symlink out of the tree.
-	var paths, underGit, escapes []string
+	var paths, underGit, links []string
 	for _, c := range changes {
 		paths = append(paths, c.path)
 		for _, seg := range strings.Split(c.path, "/") {
@@ -356,20 +423,26 @@ func (f *Forge) Propose(ctx context.Context, repo model.Repo, dir, branch, title
 			underGit = append(underGit, c.path+" (nested repository)")
 		}
 		if c.newMode == "120000" {
-			res, err := f.git(ctx, bare, "cat-file", "blob", c.newID)
-			if err != nil {
-				return none, err
-			}
-			if symlinkEscapes(c.path, string(res.out)) {
-				escapes = append(escapes, c.path)
-			}
+			links = append(links, c.path)
 		}
 	}
 	if len(underGit) > 0 {
 		return none, refuse(ErrForbiddenPath, underGit...)
 	}
-	if len(escapes) > 0 {
-		return none, refuse(ErrSymlinkEscape, escapes...)
+	if len(links) > 0 {
+		if policy.NoSymlinks {
+			for i, l := range links {
+				links[i] = l + " (symbolic link)"
+			}
+			return none, refuse(ErrForbiddenPath, links...)
+		}
+		escapes, err := f.escapingLinks(ctx, bare, links)
+		if err != nil {
+			return none, err
+		}
+		if len(escapes) > 0 {
+			return none, refuse(ErrSymlinkEscape, escapes...)
+		}
 	}
 	if bad := policy.violations(paths); len(bad) > 0 {
 		return none, refuse(ErrForbiddenPath, bad...)
@@ -422,35 +495,56 @@ func (f *Forge) Propose(ctx context.Context, repo model.Repo, dir, branch, title
 		"GIT_AUTHOR_NAME=" + f.cfg.AuthorName, "GIT_AUTHOR_EMAIL=" + f.cfg.AuthorEmail,
 		"GIT_COMMITTER_NAME=" + f.cfg.AuthorName, "GIT_COMMITTER_EMAIL=" + f.cfg.AuthorEmail,
 	}
-	res, err = f.git(ctx, commitCmd, "commit-tree", strings.TrimSpace(string(res.out)), "-p", base, "-m", title)
+	treeID := strings.TrimSpace(string(res.out))
+	if !isHexID(treeID) {
+		return none, errors.New("forge: write-tree failed")
+	}
+
+	// Push that single new branch: never forced, never onto an existing
+	// branch. A branch that already holds this very proposal (an earlier call
+	// that was interrupted, or whose merge request failed) is left as it is.
+	ref := "refs/heads/" + branch
+	existing, err := f.remoteRef(ctx, remote, repo.URL, ref)
 	if err != nil {
 		return none, err
 	}
-	commit := strings.TrimSpace(string(res.out))
-	if !isHexID(commit) {
-		return none, errors.New("forge: commit failed")
-	}
-
-	// Push that single new branch: never forced, never onto an existing branch.
-	ref := "refs/heads/" + branch
-	if id, err := f.remoteRef(ctx, remote, repo.URL, ref); err != nil {
-		return none, err
-	} else if id != "" {
-		return none, refuse(ErrBranchExists, branch)
-	}
-	if _, err := f.git(ctx, remote, "push", "-q", "--no-verify", repo.URL, commit+":"+ref); err != nil {
-		return none, err
+	if existing != "" {
+		same, err := f.sameProposal(ctx, remote, repo.URL, ref, existing, treeID, base)
+		if err != nil {
+			return none, err
+		}
+		if !same {
+			return none, refuse(ErrBranchExists, branch)
+		}
+		info, found, err := f.findOpenMR(ctx, repo, auth.token, branch)
+		if err != nil {
+			return none, err
+		}
+		if found {
+			if info.Branch == "" {
+				info.Branch = branch
+			}
+			return info, nil
+		}
+	} else {
+		res, err = f.git(ctx, commitCmd, "commit-tree", treeID, "-p", base, "-m", title)
+		if err != nil {
+			return none, err
+		}
+		commit := strings.TrimSpace(string(res.out))
+		if !isHexID(commit) {
+			return none, errors.New("forge: commit failed")
+		}
+		if _, err := f.git(ctx, remote, "push", "-q", "--no-verify", repo.URL, commit+":"+ref); err != nil {
+			return none, err
+		}
 	}
 
 	info, err := f.openMR(ctx, repo, auth.token, branch, target, title, description, draft, labels)
 	if err != nil {
-		// Do not leave an orphan branch that would block the next attempt:
-		// remove it if it still is exactly the commit pushed above.
-		if id, lerr := f.remoteRef(ctx, remote, repo.URL, ref); lerr == nil && id == commit {
-			if _, derr := f.git(ctx, remote, "push", "-q", "--no-verify", repo.URL, ":"+ref); derr != nil {
-				f.logf("forge: branch %s was pushed, the merge request failed and the branch could not be removed: %v", branch, derr)
-			}
-		}
+		// The branch stays: the next call for this branch finds it, sees the
+		// same tree and only opens the merge request.
+		f.logf("forge: branch %s is pushed but its merge request was not opened: %v", branch, err)
 		return none, err
 	}
 	if info.Branch == "" {
@@ -491,24 +585,41 @@ func (f *Forge) remoteRef(ctx context.Context, c gitCmd, repoURL, ref string) (s
 	return "", nil
 }
 
-// fetchBase fetches the commit the clone was made at and returns it. The
-// commit comes from the record made by Clone; for a clone this Forge did not
-// make, from the clone's own files, read as plain data and accepted only if
-// the remote serves that commit.
-func (f *Forge) fetchBase(ctx context.Context, c gitCmd, repoURL, target, key string) (string, error) {
-	f.mu.Lock()
-	want := f.bases[key]
-	f.mu.Unlock()
-	if want == "" {
-		want = baseHint(key)
+// sameProposal reports whether the remote branch ref, whose tip is tip, is
+// the proposal about to be pushed: one commit holding tree on top of base.
+func (f *Forge) sameProposal(ctx context.Context, c gitCmd, repoURL, ref, tip, tree, base string) (bool, error) {
+	if !isHexID(tip) {
+		return false, errors.New("forge: unreadable remote branch")
 	}
-	if want == "" {
-		return "", refuse(ErrUnknownBase, "not cloned by this forge and no readable HEAD")
+	if _, err := f.git(ctx, c, "fetch", "-q", "--depth=1", "--no-tags", "--no-recurse-submodules", repoURL, ref); err != nil {
+		return false, err
 	}
+	one := c
+	one.auth = nil
+	one.maxOut = 64 << 10
+	res, err := f.git(ctx, one, "cat-file", "commit", tip)
+	if err != nil {
+		return false, nil // the branch moved between the two calls: not ours
+	}
+	var trees, parents []string
+	header, _, _ := strings.Cut(string(res.out), "\n\n")
+	for _, l := range strings.Split(header, "\n") {
+		if v, ok := strings.CutPrefix(l, "tree "); ok {
+			trees = append(trees, v)
+		} else if v, ok := strings.CutPrefix(l, "parent "); ok {
+			parents = append(parents, v)
+		}
+	}
+	return len(trees) == 1 && trees[0] == tree && len(parents) == 1 && parents[0] == base, nil
+}
+
+// fetchBase fetches want, the commit the clone was made at according to the
+// record of Clone or RestoreBase. Nothing of the clone is read.
+func (f *Forge) fetchBase(ctx context.Context, c gitCmd, repoURL, target, want string) error {
 	fetch := []string{"fetch", "-q", "--depth=1", "--no-tags", "--no-recurse-submodules", repoURL}
 	tip := ""
 	if _, err := f.git(ctx, c, append(fetch, "refs/heads/"+target)...); err != nil {
-		return "", err
+		return err
 	}
 	if res, err := f.git(ctx, c, "rev-parse", "--verify", "FETCH_HEAD^{commit}"); err == nil {
 		tip = strings.TrimSpace(string(res.out))
@@ -516,52 +627,70 @@ func (f *Forge) fetchBase(ctx context.Context, c gitCmd, repoURL, target, key st
 	if tip != want {
 		// The default branch moved since the clone: fetch the exact commit.
 		if _, err := f.git(ctx, c, append(fetch, want)...); err != nil {
-			return "", refuse(ErrUnknownBase, "the remote does not serve the commit the clone was made at")
+			return refuse(ErrUnknownBase, "the remote does not serve the commit the clone was made at")
 		}
 	}
 	if _, err := f.git(ctx, c, "cat-file", "-e", want+"^{commit}"); err != nil {
-		return "", refuse(ErrUnknownBase, "the remote does not serve the commit the clone was made at")
+		return refuse(ErrUnknownBase, "the remote does not serve the commit the clone was made at")
 	}
-	return want, nil
+	return nil
 }
 
-// baseHint reads the commit a clone was made at from its files, without
-// running git in it: the graft point of a shallow clone, else HEAD.
-func baseHint(dir string) string {
-	gitDir := filepath.Join(dir, ".git")
-	if lines := strings.Fields(readSmall(filepath.Join(gitDir, "shallow"))); len(lines) == 1 && isHexID(lines[0]) {
-		return lines[0]
-	}
-	head := strings.TrimSpace(readSmall(filepath.Join(gitDir, "HEAD")))
-	if isHexID(head) {
-		return head
-	}
-	ref, ok := strings.CutPrefix(head, "ref: ")
-	if !ok || !strings.HasPrefix(ref, "refs/heads/") || !validRefName(ref) {
-		return ""
-	}
-	if id := strings.TrimSpace(readSmall(filepath.Join(gitDir, filepath.FromSlash(ref)))); isHexID(id) {
-		return id
-	}
-	for _, l := range strings.Split(readSmall(filepath.Join(gitDir, "packed-refs")), "\n") {
-		if id, name, ok := strings.Cut(l, " "); ok && name == ref && isHexID(id) {
-			return id
+// measureTree refuses a working tree with more than maxFiles entries or more
+// than maxBytes of regular files. It only lists directories and calls lstat:
+// no file is opened, no link is followed, and it stops at the first cap
+// exceeded. The .git directory at the root is skipped, git never adds it.
+func measureTree(ctx context.Context, root string, maxFiles int, maxBytes int64) error {
+	files, size := 0, int64(0)
+	stack := []string{root}
+	for len(stack) > 0 {
+		dir := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if st, err := os.Lstat(dir); err != nil || !st.IsDir() {
+			continue // replaced meanwhile; never follow a link
+		}
+		fh, err := os.Open(dir)
+		if err != nil {
+			return fmt.Errorf("forge: unreadable directory in the working tree: %v", err)
+		}
+		for {
+			entries, err := fh.ReadDir(256)
+			for _, e := range entries {
+				if dir == root && e.Name() == ".git" {
+					continue
+				}
+				if files++; files > maxFiles {
+					fh.Close()
+					return refuse(ErrTooLarge, fmt.Sprintf("more than %d files in the working tree (limit MaxTreeFiles)", maxFiles))
+				}
+				full := filepath.Join(dir, e.Name())
+				switch {
+				case e.IsDir():
+					stack = append(stack, full)
+				case e.Type().IsRegular():
+					st, err := os.Lstat(full)
+					if err != nil || !st.Mode().IsRegular() {
+						continue
+					}
+					if size += st.Size(); size > maxBytes {
+						fh.Close()
+						return refuse(ErrTooLarge, fmt.Sprintf("more than %d bytes in the working tree (limit MaxTreeBytes)", maxBytes))
+					}
+				}
+			}
+			if err != nil { // io.EOF, or a directory that cannot be listed further
+				fh.Close()
+				if err != io.EOF {
+					return fmt.Errorf("forge: unreadable directory in the working tree: %v", err)
+				}
+				break
+			}
 		}
 	}
-	return ""
-}
-
-// readSmall returns the content of a regular file of at most 4 MiB, "" otherwise.
-func readSmall(file string) string {
-	st, err := os.Lstat(file)
-	if err != nil || !st.Mode().IsRegular() || st.Size() > 4<<20 {
-		return ""
-	}
-	data, err := os.ReadFile(file)
-	if err != nil {
-		return ""
-	}
-	return string(data)
+	return nil
 }
 
 // changes lists the staged differences against base.
@@ -617,11 +746,156 @@ func (f *Forge) checkBinaries(ctx context.Context, c gitCmd, base string, change
 	return nil
 }
 
-// symlinkEscapes reports whether a link at name with that target leaves the tree.
-func symlinkEscapes(name, target string) bool {
-	if target == "" || strings.HasPrefix(target, "/") || strings.ContainsRune(target, 0) {
-		return true
+// maxLinkHops is how many links one resolution may follow.
+const maxLinkHops = 40
+
+// maxLinkTarget is the longest link target accepted, as PATH_MAX.
+const maxLinkTarget = 4096
+
+// treeLinks returns the target of every symbolic link of the staged tree.
+func (f *Forge) treeLinks(ctx context.Context, c gitCmd) (map[string]string, error) {
+	res, err := f.git(ctx, c, "ls-files", "--stage", "-z")
+	if err != nil {
+		return nil, err
 	}
-	resolved := path.Join(path.Dir(name), target)
-	return resolved == ".." || strings.HasPrefix(resolved, "../")
+	if res.truncated {
+		return nil, refuse(ErrTooLarge, "too many files to check the symbolic links")
+	}
+	ids := map[string][]string{} // blob -> paths
+	var stdin bytes.Buffer
+	for _, rec := range strings.Split(string(res.out), "\x00") {
+		meta, name, ok := strings.Cut(rec, "\t")
+		fields := strings.Fields(meta)
+		if !ok || len(fields) != 3 || fields[0] != "120000" || !isHexID(fields[1]) {
+			continue
+		}
+		if ids[fields[1]] == nil {
+			stdin.WriteString(fields[1] + "\n")
+		}
+		ids[fields[1]] = append(ids[fields[1]], name)
+	}
+	links := map[string]string{}
+	if len(ids) == 0 {
+		return links, nil
+	}
+	batch := c
+	batch.stdin = stdin.Bytes()
+	res, err = f.git(ctx, batch, "cat-file", "--batch")
+	if err != nil {
+		return nil, err
+	}
+	if res.truncated {
+		return nil, refuse(ErrTooLarge, "symbolic links too large to be checked")
+	}
+	out := res.out
+	for len(out) > 0 {
+		head, rest, ok := bytes.Cut(out, []byte{'\n'})
+		fields := strings.Fields(string(head))
+		if !ok || len(fields) != 3 || fields[1] != "blob" {
+			return nil, errors.New("forge: unreadable symbolic link")
+		}
+		size, err := strconv.Atoi(fields[2])
+		if err != nil || size < 0 || size >= len(rest) || rest[size] != '\n' {
+			return nil, errors.New("forge: unreadable symbolic link")
+		}
+		target := string(rest[:size])
+		if size > maxLinkTarget {
+			target = "" // refused by symlinkEscapes
+		}
+		for _, name := range ids[fields[0]] {
+			links[name] = target
+		}
+		delete(ids, fields[0])
+		out = rest[size+1:]
+	}
+	if len(ids) != 0 {
+		return nil, errors.New("forge: unreadable symbolic link")
+	}
+	return links, nil
+}
+
+// escapingLinks returns the links of the staged tree that leave the
+// repository once every link of that tree is followed, limited to those whose
+// resolution involves a link of changed: a changed link itself, or an older
+// link that one of the changed links now leads outside.
+func (f *Forge) escapingLinks(ctx context.Context, c gitCmd, changed []string) ([]string, error) {
+	links, err := f.treeLinks(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	isChanged := map[string]bool{}
+	for _, name := range changed {
+		isChanged[name] = true
+		if _, ok := links[name]; !ok {
+			return nil, errors.New("forge: unreadable symbolic link")
+		}
+	}
+	names := make([]string, 0, len(links))
+	for name := range links {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var bad []string
+	for _, name := range names {
+		escapes, followed := symlinkEscapes(links, name)
+		if !escapes {
+			continue
+		}
+		for _, l := range followed {
+			if isChanged[l] {
+				bad = append(bad, name)
+				break
+			}
+		}
+	}
+	return bad, nil
+}
+
+// unsafeTarget reports a link target that can never be accepted.
+func unsafeTarget(target string) bool {
+	return target == "" || strings.HasPrefix(target, "/") || strings.ContainsRune(target, 0)
+}
+
+// symlinkEscapes resolves the link at name inside the tree described by
+// links (path -> target of every link of the tree), one component at a time,
+// following the other links it meets. It reports true when the resolution
+// reaches or passes above the repository root, meets an absolute or empty
+// target, or needs more than maxLinkHops links (a loop). followed lists the
+// links that were read, name first.
+func symlinkEscapes(links map[string]string, name string) (escapes bool, followed []string) {
+	followed = []string{name}
+	target := links[name]
+	if unsafeTarget(target) {
+		return true, followed
+	}
+	var cur []string // resolved directory, from the root
+	if d := path.Dir(name); d != "." {
+		cur = strings.Split(d, "/")
+	}
+	pending := strings.Split(target, "/")
+	for len(pending) > 0 {
+		comp := pending[0]
+		pending = pending[1:]
+		switch comp {
+		case "", ".":
+			continue
+		case "..":
+			if len(cur) == 0 {
+				return true, followed
+			}
+			cur = cur[:len(cur)-1]
+			continue
+		}
+		next := strings.Join(append(cur[:len(cur):len(cur)], comp), "/")
+		if t, ok := links[next]; ok {
+			followed = append(followed, next)
+			if len(followed) > maxLinkHops || unsafeTarget(t) {
+				return true, followed
+			}
+			pending = append(strings.Split(t, "/"), pending...)
+			continue
+		}
+		cur = append(cur, comp)
+	}
+	return false, followed
 }

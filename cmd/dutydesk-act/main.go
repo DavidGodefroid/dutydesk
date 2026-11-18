@@ -11,13 +11,28 @@
 // The script's stdout and stderr are passed through, each capped at
 // 64 KiB, and the launcher exits with the script's exit code.
 //
-// Environment of the launcher (set by the host's administrator; an agent
-// coming through lockssh cannot set any):
+// Only regular files run: the catalogue directory, the action directory,
+// the manifest and the script are checked with Lstat, and a symbolic link
+// (or a device, a FIFO, a directory in place of a file) is refused.
+//
+// Environment of the launcher (set by the host's administrator):
 //
 //	DUTYDESK_ACTIONS_DIR        catalogue, default /opt/dutydesk/actions
 //	DUTYDESK_ACTIONS_STATE_DIR  rate-limit state, default /var/lib/dutydesk-act
 //	DUTYDESK_ACTIONS_AUDIT_LOG  audit log, default <state dir>/audit.log
 //	DUTYDESK_ACTIONS_ENV_DIR    per-action env files, default /etc/dutydesk/actions.env.d
+//
+// When the launcher is invoked through SSH (SSH_CONNECTION or SSH_CLIENT is
+// set), which is how an agent reaches it through lockssh, these four
+// variables are IGNORED and the defaults apply: whoever comes through SSH
+// must not choose the catalogue or the audit log. The administrator can
+// allow them again in /etc/dutydesk/act.conf, a regular file owned by root
+// that is neither group- nor world-writable:
+//
+//	allow_env_overrides = true
+//
+// An act.conf that is present but not trustworthy (a link, another owner,
+// too open, an unknown key) stops the launcher: nothing runs.
 //
 // The script receives only PATH, HOME, USER, LOGNAME, LANG, LC_ALL and TZ
 // from the launcher's environment, DUTYDESK_ACTION, and the KEY=VALUE
@@ -77,6 +92,97 @@ var passedEnv = []string{"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "T
 // now is replaced in tests.
 var now = time.Now
 
+// dirs are the directories of an installation.
+type dirs struct{ catalogue, state, envDir string }
+
+// defaults apply when the environment does not, or may not, say otherwise.
+// Replaced in tests, like confPath and confOwnerUID.
+var defaults = dirs{catalogue: actions.DefaultCatalogueDir, state: defaultStateDir, envDir: defaultEnvDir}
+
+var (
+	// confPath is the administrator's file that may allow the environment
+	// overrides over SSH.
+	confPath = "/etc/dutydesk/act.conf"
+	// confOwnerUID must own confPath.
+	confOwnerUID = 0
+)
+
+// overrideVars are the variables that move the launcher's directories.
+var overrideVars = []string{
+	"DUTYDESK_ACTIONS_DIR", "DUTYDESK_ACTIONS_STATE_DIR", "DUTYDESK_ACTIONS_AUDIT_LOG", "DUTYDESK_ACTIONS_ENV_DIR",
+}
+
+// envOverridesAllowed reads act.conf: "key = value" lines, "#" comments.
+// The only key is allow_env_overrides (true | false). A missing file
+// allows nothing. The file must be a regular file (never a link) owned by
+// confOwnerUID and neither group- nor world-writable, else it is an error.
+func envOverridesAllowed(path string) (bool, error) {
+	// O_NOFOLLOW: a link is an error; the checks are made on the file that
+	// was opened, not on a name that could change in between.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return false, errors.New("is a symbolic link")
+		}
+		return false, errors.New("cannot be opened")
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return false, errors.New("cannot be read")
+	}
+	if !st.Mode().IsRegular() {
+		return false, errors.New("not a regular file")
+	}
+	if sys, ok := st.Sys().(*syscall.Stat_t); !ok || int(sys.Uid) != confOwnerUID {
+		return false, fmt.Errorf("not owned by uid %d", confOwnerUID)
+	}
+	if st.Mode().Perm()&0o022 != 0 {
+		return false, fmt.Errorf("mode %04o is group- or world-writable", st.Mode().Perm())
+	}
+	allowed := false
+	sc := bufio.NewScanner(f)
+	for n := 1; sc.Scan(); n++ {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
+		switch {
+		case !ok || key != "allow_env_overrides":
+			return false, fmt.Errorf("line %d: want \"allow_env_overrides = true|false\"", n)
+		case val == "true":
+			allowed = true
+		case val == "false":
+			allowed = false
+		default:
+			return false, fmt.Errorf("line %d: allow_env_overrides: want true or false", n)
+		}
+	}
+	return allowed, sc.Err()
+}
+
+// realDir reports, with Lstat, whether path is a directory that is not a
+// symbolic link. A missing path is (false, nil).
+func realDir(path string) (bool, error) {
+	st, err := os.Lstat(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	case err != nil:
+		return false, errors.New("cannot be read")
+	case st.Mode()&os.ModeSymlink != 0:
+		return false, errors.New("is a symbolic link")
+	case !st.IsDir():
+		return false, errors.New("is not a directory")
+	}
+	return true, nil
+}
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
 }
@@ -93,17 +199,6 @@ type auditRecord struct {
 }
 
 func run(argv []string, getenv func(string) string, stdout, stderr io.Writer) int {
-	env := func(key, def string) string {
-		if v := getenv(key); v != "" {
-			return v
-		}
-		return def
-	}
-	catalogue := env("DUTYDESK_ACTIONS_DIR", actions.DefaultCatalogueDir)
-	stateDir := env("DUTYDESK_ACTIONS_STATE_DIR", defaultStateDir)
-	auditPath := env("DUTYDESK_ACTIONS_AUDIT_LOG", filepath.Join(stateDir, "audit.log"))
-	envDir := env("DUTYDESK_ACTIONS_ENV_DIR", defaultEnvDir)
-
 	fail := func(code int, format string, args ...any) int {
 		fmt.Fprintf(stderr, "dutydesk-act: "+format+"\n", args...)
 		return code
@@ -111,6 +206,36 @@ func run(argv []string, getenv func(string) string, stdout, stderr io.Writer) in
 	if len(argv) == 0 || argv[0] == "-h" || argv[0] == "--help" {
 		return fail(exitUsage, "usage: dutydesk-act <action> [--param value ...]")
 	}
+
+	// Through SSH (lockssh), the environment does not move the catalogue,
+	// the state or the audit log unless the administrator's act.conf says so.
+	honourEnv := true
+	if getenv("SSH_CONNECTION") != "" || getenv("SSH_CLIENT") != "" {
+		overridden := false
+		for _, key := range overrideVars {
+			overridden = overridden || getenv(key) != ""
+		}
+		if overridden {
+			allowed, err := envOverridesAllowed(confPath)
+			if err != nil {
+				return fail(exitInternal, "%s: %v; nothing ran", confPath, err)
+			}
+			if !allowed {
+				honourEnv = false
+				fmt.Fprintf(stderr, "dutydesk-act: the DUTYDESK_ACTIONS_* variables are ignored over SSH (allow_env_overrides in %s)\n", confPath)
+			}
+		}
+	}
+	env := func(key, def string) string {
+		if v := getenv(key); v != "" && honourEnv {
+			return v
+		}
+		return def
+	}
+	catalogue := env("DUTYDESK_ACTIONS_DIR", defaults.catalogue)
+	stateDir := env("DUTYDESK_ACTIONS_STATE_DIR", defaults.state)
+	auditPath := env("DUTYDESK_ACTIONS_AUDIT_LOG", filepath.Join(stateDir, "audit.log"))
+	envDir := env("DUTYDESK_ACTIONS_ENV_DIR", defaults.envDir)
 
 	// Fail closed: nothing runs without a place to record it.
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
@@ -147,11 +272,24 @@ func run(argv []string, getenv func(string) string, stdout, stderr io.Writer) in
 	}
 	rec.Action = name
 	// Absolute: the script runs with its own directory as working directory.
-	actionDir, err := filepath.Abs(filepath.Join(catalogue, name))
+	catalogue, err = filepath.Abs(catalogue)
 	if err != nil {
 		return finish(exitInternal, "error", "catalogue: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(actionDir, actions.ManifestName)); err != nil {
+	actionDir := filepath.Join(catalogue, name)
+	// Lstat, never Stat: the catalogue, the action directory, the manifest
+	// and the script (LoadAction) are what was installed, not a link to
+	// something else.
+	for _, d := range []struct{ what, path string }{{"the catalogue", catalogue}, {"the directory of action " + name, actionDir}} {
+		ok, err := realDir(d.path)
+		if err != nil {
+			return finish(exitInternal, "error", "%s %v; nothing ran", d.what, err)
+		}
+		if !ok {
+			return finish(exitUsage, "rejected", "unknown action %s", name)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(actionDir, actions.ManifestName)); errors.Is(err, os.ErrNotExist) {
 		return finish(exitUsage, "rejected", "unknown action %s", name)
 	}
 	action, err := actions.LoadAction(actionDir)

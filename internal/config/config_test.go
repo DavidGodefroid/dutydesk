@@ -108,7 +108,7 @@ func TestLoadExample(t *testing.T) {
 	}
 	rules, err := actions.LockSSHRules(p, actions.DefaultInstallDir)
 	if err != nil || len(rules["docflow-stuck-job"].Rules) != 2 || rules["docflow-stuck-job"].Run != "auto" ||
-		len(rules["docflow-stuck-job-ask"].Rules) != 1 || rules["docflow-stuck-job-ask"].Run != "ask" {
+		len(rules["docflow-stuck-job-ask"].Rules) != 3 || rules["docflow-stuck-job-ask"].Run != "ask" { // one rule per enum value
 		t.Errorf("lockssh rules: %v %+v", err, rules)
 	}
 

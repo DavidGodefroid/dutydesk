@@ -137,7 +137,11 @@ exit 3
 }
 
 func TestNoShell(t *testing.T) {
+	// The script is run without a shell, and no shell syntax can reach it
+	// anyway: an installed manifest whose pattern admits shell
+	// metacharacters is refused as a whole, nothing runs.
 	h := newHost(t)
+	marker := filepath.Join(h.root, "ran")
 	h.install("echo-tag", `description: Echo
 level: auto
 script: run.sh
@@ -146,10 +150,15 @@ params:
     type: string
     pattern: "^[a-z$;()|&>*]{1,20}$"
 rate_limit: {count: 9, window: 1h}
-`, "#!/bin/sh\nprintf '%s\\n' \"$2\"\n")
-	code, out, _ := h.run("echo-tag", "--tag", "$(id);ls|a>b&*")
-	if code != 0 || out != "$(id);ls|a>b&*\n" {
-		t.Errorf("code %d, stdout %q: the value was not passed literally", code, out)
+`, "#!/bin/sh\ntouch "+marker+"\nprintf '%s\\n' \"$2\"\n")
+	for _, v := range []string{"$(id);ls|a>b&*", "abc"} {
+		code, out, errb := h.run("echo-tag", "--tag", v)
+		if code != exitInternal || out != "" || !strings.Contains(errb, "installed manifest refused") {
+			t.Errorf("%q: code %d, stdout %q, stderr %q; want the manifest refused (exit 70)", v, code, out, errb)
+		}
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("the script ran under a manifest that admits shell metacharacters")
 	}
 }
 

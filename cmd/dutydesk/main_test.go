@@ -202,3 +202,16 @@ func TestCoreAgentToken(t *testing.T) {
 		t.Errorf("token file mode: %v %v", st, err)
 	}
 }
+
+// Finding 8: nothing the CLI prints can drive the terminal.
+func TestTerminalOutputIsSafe(t *testing.T) {
+	var out bytes.Buffer
+	w := termSafe{&out}
+	in := "ok\tfine\n\x1b[2J\x1b]0;title\x07evil\r\u009b31m é ✓\x7f\n"
+	if n, err := w.Write([]byte(in)); err != nil || n != len(in) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	if got, want := out.String(), "ok\tfine\n[2J]0;titleevil31m é ✓\n"; got != want {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+}

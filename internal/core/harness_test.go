@@ -124,11 +124,29 @@ type fakeReader struct {
 	rows  []model.Row
 	count int
 	calls int
+	// block makes every SQL call wait until it is closed (a slow lock).
+	block   chan struct{}
+	live    int
+	maxLive int
 }
 
-func (r *fakeReader) SQL(_ context.Context, _ *model.Project, query string) ([]model.Row, error) {
+func (r *fakeReader) SQL(ctx context.Context, _ *model.Project, query string) ([]model.Row, error) {
+	r.mu.Lock()
+	block := r.block
+	r.live++
+	if r.live > r.maxLive {
+		r.maxLive = r.live
+	}
+	r.mu.Unlock()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.live--
 	r.calls++
 	if !strings.Contains(query, "FROM jobs") {
 		return []model.Row{{"id": "1"}}, nil // the morning load is there
@@ -165,6 +183,7 @@ type fakeStatus struct {
 	locks     map[string]string
 	tickets   map[string]model.TicketState
 	withdrawn []string
+	always    model.TicketState // state of a ticket that was not set, "" = unknown
 }
 
 func (f *fakeStatus) Health(context.Context, string) (model.LockHealth, error) {
@@ -178,6 +197,9 @@ func (f *fakeStatus) Ticket(_ context.Context, _, ticket string) (model.TicketSt
 	defer f.mu.Unlock()
 	if st, ok := f.tickets[ticket]; ok {
 		return st, nil
+	}
+	if f.always != "" {
+		return f.always, nil
 	}
 	return model.TicketUnknown, nil
 }
@@ -216,6 +238,11 @@ type fakeLauncher struct {
 	maxLive  int
 	// hang makes every pass wait until the daemon cancels it.
 	hang bool
+	// reader is the production the agent acts on: a pass that answers
+	// "resolved" really fixed the condition (the deterministic check no
+	// longer fires), unless lies is set.
+	reader *fakeReader
+	lies   bool
 }
 
 func (l *fakeLauncher) queue(steps ...step) {
@@ -252,7 +279,14 @@ func (l *fakeLauncher) Run(ctx context.Context, req model.RunRequest) model.RunR
 	if ctx.Err() != nil {
 		return model.RunResult{Status: model.RunCancelled, Error: "pass cancelled; container killed"}
 	}
-	return st(req)
+	res := st(req)
+	l.mu.Lock()
+	honest := l.reader != nil && !l.lies
+	l.mu.Unlock()
+	if honest && res.Verdict != nil && res.Verdict.Outcome == model.OutcomeResolved {
+		l.reader.set()
+	}
+	return res
 }
 
 func (l *fakeLauncher) requests() []model.RunRequest {
@@ -279,6 +313,7 @@ type fakeRuntime struct {
 	mu    sync.Mutex
 	names string
 	rm    []string
+	stuck map[string]bool // containers `rm -f` does not remove
 }
 
 func (f *fakeRuntime) Run(_ context.Context, c agent.Command) (int, error) {
@@ -289,8 +324,24 @@ func (f *fakeRuntime) Run(_ context.Context, c agent.Command) (int, error) {
 		io.WriteString(c.Stdout, f.names)
 	case "rm":
 		f.rm = append(f.rm, c.Args[2:]...)
+	case "inspect":
+		if f.stuck[c.Args[len(c.Args)-1]] {
+			io.WriteString(c.Stdout, "[{}]")
+			return 0, nil
+		}
+		io.WriteString(c.Stderr, "Error: no such container")
+		return 125, nil
 	}
 	return 0, nil
+}
+
+func (f *fakeRuntime) setStuck(name string, v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stuck == nil {
+		f.stuck = map[string]bool{}
+	}
+	f.stuck[name] = v
 }
 
 func (f *fakeRuntime) removed() []string {
@@ -311,6 +362,8 @@ type fakeGitLab struct {
 	mu     sync.Mutex
 	opened []mrCall
 	states map[string]string // "<project>!<iid>" -> state
+	// down makes the API answer 503 to everything (the forge is unreachable).
+	down bool
 }
 
 func newFakeGitLab(t *testing.T) *fakeGitLab {
@@ -325,6 +378,19 @@ func newFakeGitLab(t *testing.T) *fakeGitLab {
 		g.mu.Lock()
 		defer g.mu.Unlock()
 		switch {
+		case g.down:
+			http.Error(w, `{"message":"503 down"}`, http.StatusServiceUnavailable)
+		case r.Method == http.MethodGet && len(parts) == 2 && parts[1] == "merge_requests":
+			// Open merge requests of a source branch.
+			list := []map[string]any{}
+			for i, c := range g.opened {
+				if c.Project == project && c.Body["source_branch"] == r.URL.Query().Get("source_branch") &&
+					g.states[fmt.Sprintf("%s!%d", project, i+1)] == "opened" {
+					list = append(list, map[string]any{"iid": i + 1, "state": "opened", "source_branch": c.Body["source_branch"],
+						"web_url": fmt.Sprintf("https://gitlab.example.com/%s/-/merge_requests/%d", project, i+1)})
+				}
+			}
+			json.NewEncoder(w).Encode(list)
 		case r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "merge_requests":
 			var body map[string]any
 			_ = json.Unmarshal(raw, &body)
@@ -352,6 +418,8 @@ func (g *fakeGitLab) calls() []mrCall {
 	defer g.mu.Unlock()
 	return append([]mrCall(nil), g.opened...)
 }
+
+func (g *fakeGitLab) setDown(v bool) { g.mu.Lock(); g.down = v; g.mu.Unlock() }
 
 func (g *fakeGitLab) setState(project string, iid int, state string) {
 	g.mu.Lock()
@@ -470,7 +538,7 @@ func newWorld(t *testing.T, opts ...worldOpt) *world {
 	w := &world{t: t, dir: dir, clock: &fakeClock{now: t0}, crons: &cronSet{}, reader: &fakeReader{},
 		status: &fakeStatus{serving: true, tickets: map[string]model.TicketState{}},
 		rec:    &notify.Recorder{}, gitlab: newFakeGitLab(t), logs: &syncBuffer{}}
-	w.agent = &fakeLauncher{t: t}
+	w.agent = &fakeLauncher{t: t, reader: w.reader}
 
 	secrets := filepath.Join(dir, "secrets")
 	writeFile(t, filepath.Join(secrets, "seat-a.token"), seatTokenA+"\n", 0o600)
@@ -578,7 +646,7 @@ func (w *world) startWith(tune func(*Options)) {
 	go func() { w.done <- svc.Run(ctx) }()
 	w.t.Cleanup(w.stop)
 	// The scheduler and the lock gate are up once a first turn has run.
-	w.eventually("service up", func() bool { return svc.Healthy() && w.cronStarted() })
+	w.eventually("service up", func() bool { return svc.Healthy() && w.cronStarted() && svc.gateKnown() })
 }
 
 func (w *world) cronStarted() bool {
@@ -629,8 +697,25 @@ func (w *world) eventually(what string, cond func() bool) {
 	}
 }
 
-// settle lets the loops turn a few times before a negative assertion.
-func (w *world) settle() { time.Sleep(40 * time.Millisecond) }
+// settle lets the owed effects go out (when they can) and the loops turn a
+// few times before a negative assertion.
+func (w *world) settle() {
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if owed, err := w.store().PendingEffects(""); err != nil || len(owed) == 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	time.Sleep(40 * time.Millisecond)
+}
+
+// gateKnown reports whether the lock gate was polled once.
+func (s *Service) gateKnown() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.gate) > 0
+}
 
 func (w *world) incidents() []model.Incident {
 	w.t.Helper()
@@ -652,11 +737,15 @@ func (w *world) incident(id string) model.Incident {
 
 func (w *world) waitState(id string, want model.IncidentState) model.Incident {
 	w.t.Helper()
+	// The incident is returned as it was seen in the state: it may move on
+	// at once (an escalated incident whose condition cleared is closed).
+	var seen model.Incident
 	w.eventually(fmt.Sprintf("%s in state %s", id, want), func() bool {
 		inc, err := w.store().GetIncident(id)
+		seen = inc
 		return err == nil && inc.State == want
 	})
-	return w.incident(id)
+	return seen
 }
 
 func (w *world) waitIncidents(n int) {
@@ -696,11 +785,27 @@ func (w *world) wantKinds(want ...model.AlertKind) {
 
 func (w *world) wantJournal(id string, parts ...string) {
 	w.t.Helper()
-	text := w.journal(id)
-	for _, p := range parts {
-		if !strings.Contains(text, p) {
-			w.t.Errorf("journal of %s lacks %q:\n%s", id, p, text)
+	// The journal is written right after the transaction of a transition:
+	// it is given a moment.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		text := w.journal(id)
+		var missing []string
+		for _, p := range parts {
+			if !strings.Contains(text, p) {
+				missing = append(missing, p)
+			}
 		}
+		if len(missing) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			for _, p := range missing {
+				w.t.Errorf("journal of %s lacks %q:\n%s", id, p, text)
+			}
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 
@@ -751,3 +856,40 @@ func (w *world) noSecrets() {
 		}
 	}
 }
+
+// restart stops the service cleanly and starts a new one on the same data
+// directory: a new store handle, a new forge (no memory of the clones), a
+// new scripted agent.
+func (w *world) restart(tune func(*Options)) *world {
+	w.t.Helper()
+	w.stop()
+	w2 := *w
+	w2.agent = &fakeLauncher{t: w.t, reader: w.reader}
+	w2.crons = &cronSet{}
+	w2.startWith(tune)
+	return &w2
+}
+
+// flaky is a notifier whose channel can be down.
+type flaky struct {
+	mu   sync.Mutex
+	down bool
+	fail int
+	next model.Notifier
+}
+
+func (f *flaky) Send(ctx context.Context, p *model.Project, a model.Alert) error {
+	f.mu.Lock()
+	down := f.down
+	if down {
+		f.fail++
+	}
+	f.mu.Unlock()
+	if down {
+		return fmt.Errorf("notify: webhook answered HTTP 503")
+	}
+	return f.next.Send(ctx, p, a)
+}
+
+func (f *flaky) set(down bool) { f.mu.Lock(); f.down = down; f.mu.Unlock() }
+func (f *flaky) failures() int { f.mu.Lock(); defer f.mu.Unlock(); return f.fail }

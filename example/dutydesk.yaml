@@ -36,6 +36,14 @@ seats:
 max_parallel_runs: 3                   # across all projects
 # claude_model: ""                     # empty = the claude CLI's default
 
+# quota_cap: 5h                        # longest time a seat may stay marked exhausted, whatever
+#                                      # reset time a pass reports; 10m to 24h
+
+# Pruning of resolved incidents. Durations take a leading number of days ("30d" = 720h).
+# retention:
+#   transcripts: 30d                   # agent transcripts; at least 1h
+#   incidents: 180d                    # dossiers and database rows; never shorter than transcripts
+
 heartbeat:
   url: https://heartbeat.example.com/ping/dutydesk
   every: 1m
@@ -51,8 +59,15 @@ agent:
     - /opt/lockfamily/bin:/opt/lockfamily/bin:ro           # lock client binaries
     - /run/lox-live/clients/{project}:/run/locks:ro        # client sockets / launch material of the project's locks
   user: "10001:10001"                  # the image's agent user
+  # An allow-list, each entry ONE "--flag=value" argument; anything else is refused:
+  #   --userns=keep-id[:uid=N,gid=N]
+  #   --security-opt=label=disable | label=type:T | label=level:L | label=user:U | label=role:R   (SELinux only)
+  #   --annotation=key=value   --label=key=value
   run_args:
     - --userns=keep-id:uid=10001,gid=10001   # rootless podman: lets the agent write the mounted clones
+    # - --security-opt=label=disable         # SELinux host that cannot relabel the mounts
+    # - --label=com.example.owner=ops
+  # max_transcript_bytes: 20971520     # transcript kept of one pass (20 MiB); 64 KiB to 1 GiB
   memory: 4g
   cpus: "2"
   pids_limit: 512

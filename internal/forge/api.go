@@ -232,6 +232,59 @@ func (f *Forge) openMR(ctx context.Context, repo model.Repo, token, branch, targ
 	return model.MRInfo{}, fmt.Errorf("forge: unknown forge %q", repo.Forge)
 }
 
+// findOpenMR looks for an open merge request (GitLab) or pull request (GitHub)
+// whose source is branch. ok is false when there is none.
+func (f *Forge) findOpenMR(ctx context.Context, repo model.Repo, token, branch string) (info model.MRInfo, ok bool, err error) {
+	switch repo.Forge {
+	case "gitlab":
+		base, err := gitlabProject(repo)
+		if err != nil {
+			return info, false, err
+		}
+		var list []glMR
+		path := base + "/merge_requests?source_branch=" + url.QueryEscape(branch) + "&state=opened"
+		if err := f.call(ctx, repo, token, http.MethodGet, path, nil, &list); err != nil {
+			return info, false, err
+		}
+		for _, mr := range list {
+			if mr.SourceBranch != branch {
+				continue
+			}
+			if info, err = mr.info(); err != nil {
+				return info, false, err
+			}
+			if info.State == "open" {
+				return info, true, nil
+			}
+		}
+		return model.MRInfo{}, false, nil
+	case "github":
+		base, err := githubRepo(repo)
+		if err != nil {
+			return info, false, err
+		}
+		owner, _, _ := strings.Cut(strings.Trim(repo.Project, "/"), "/")
+		var list []ghPR
+		path := base + "/pulls?head=" + url.QueryEscape(owner+":"+branch) + "&state=open"
+		if err := f.call(ctx, repo, token, http.MethodGet, path, nil, &list); err != nil {
+			return info, false, err
+		}
+		for _, pr := range list {
+			if pr.Head.Ref != branch {
+				continue
+			}
+			if info, err = pr.info(); err != nil {
+				return info, false, err
+			}
+			if info.State == "open" {
+				return info, true, nil
+			}
+		}
+		return model.MRInfo{}, false, nil
+	}
+	return info, false, fmt.Errorf("forge: unknown forge %q", repo.Forge)
+}
+
 // Status returns the state of a merge request or pull request: open, merged or closed.
 func (f *Forge) Status(ctx context.Context, repo model.Repo, id string) (model.MRInfo, error) {
 	if id == "" || len(id) > 18 || strings.Trim(id, "0123456789") != "" {

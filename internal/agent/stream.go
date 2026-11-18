@@ -12,7 +12,9 @@ import (
 
 // streamEvent is the subset of a `claude -p --output-format stream-json` line
 // the launcher reads. Shapes confirmed against the SDK message schemas
-// embedded in claude 2.1.327 (not against a live session):
+// embedded in claude 2.1.327 and against a real capture of that version
+// (testdata/real-2.1.327.jsonl: a rate_limit_event and a success result whose
+// structured_output is a JSON object):
 //
 //	{"type":"result","subtype":"success"|"error_during_execution"|"error_max_turns"|
 //	 "error_max_budget_usd"|"error_max_structured_output_retries","is_error":bool,
@@ -35,7 +37,6 @@ type streamEvent struct {
 	StructuredOutput json.RawMessage `json:"structured_output"`
 	APIErrorStatus   *int            `json:"api_error_status"`
 	Errors           json.RawMessage `json:"errors"`
-	Error            json.RawMessage `json:"error"`
 	RateLimitInfo    *rateLimitInfo  `json:"rate_limit_info"`
 }
 
@@ -48,8 +49,9 @@ type streamUsage struct {
 
 type rateLimitInfo struct {
 	Status string `json:"status"`
-	// VERIFY: resetsAt is an integer in the schema; assumed to be Unix
-	// seconds (a value above 1e12 is read as milliseconds).
+	// resetsAt is Unix seconds (confirmed on claude 2.1.327, see
+	// testdata/real-2.1.327.jsonl). A value above 1e12 is still read as
+	// milliseconds, should a later version change the unit.
 	ResetsAt      int64  `json:"resetsAt"`
 	RateLimitType string `json:"rateLimitType"`
 }
@@ -58,25 +60,42 @@ type rateLimitInfo struct {
 // line still goes to the transcript but is not parsed.
 const maxParsedLine = 32 << 20
 
+// DefaultMaxTranscriptBytes caps the transcript file of one pass.
+const DefaultMaxTranscriptBytes int64 = 20 << 20
+
+// truncationMarker is the last line of a transcript that reached its cap.
+const truncationMarker = `{"type":"dutydesk_truncated","reason":"transcript size cap reached; the rest of the stream was parsed but not stored"}` + "\n"
+
 // transcript receives the container's stdout: it writes every line to the
 // transcript file with the secrets scrubbed, and remembers the events the
 // launcher needs. Writes come from a single goroutine (the Runner).
+//
+// Everything in the stream is untrusted: the agent can make it as long as it
+// wants. The file is capped at max bytes (plus one marker line); past the cap
+// the stream is still read and parsed, only no longer stored.
 type transcript struct {
-	out     io.Writer
-	secrets [][]byte
-	buf     []byte
-	skip    bool // current line overflowed maxParsedLine
-	werr    error
-	started bool // at least one JSON event was read
+	out       io.Writer
+	secrets   [][]byte
+	buf       []byte
+	skip      bool  // current line overflowed maxParsedLine
+	max       int64 // cap on the bytes written to out; <= 0 = DefaultMaxTranscriptBytes
+	written   int64
+	midLine   bool // the last bytes written did not end a line
+	truncated bool // the cap was reached: nothing more is written
+	werr      error
 
-	result         *streamEvent // last result event
-	rejected       bool         // a rate_limit_event said "rejected"
-	rejectedReset  int64
-	assistantError string // last assistant-level error tag (e.g. "rate_limit")
+	result *streamEvent // last result event
+	// rejectedReset is the resetsAt of the last rate_limit_event that said
+	// "rejected" (0 = none). It never decides the outcome: it only gives the
+	// reset time of a quota outcome established by the final result.
+	rejectedReset int64
 }
 
-func newTranscript(out io.Writer, secrets ...string) *transcript {
-	t := &transcript{out: out}
+func newTranscript(out io.Writer, max int64, secrets ...string) *transcript {
+	if max <= 0 {
+		max = DefaultMaxTranscriptBytes
+	}
+	t := &transcript{out: out, max: max}
 	for _, s := range secrets {
 		if s != "" {
 			t.secrets = append(t.secrets, []byte(s))
@@ -118,11 +137,34 @@ func (t *transcript) flush(complete bool) {
 	if complete && !t.skip {
 		t.parse(line)
 	}
-	if _, err := t.out.Write(scrub(line, t.secrets)); err != nil && t.werr == nil {
-		t.werr = err
-	}
+	t.store(scrub(line, t.secrets))
 	t.buf = t.buf[:0]
 	t.skip = !complete
+}
+
+// store writes b to the transcript file unless the cap is reached. The piece
+// that would cross the cap is dropped whole and replaced, once, by the
+// truncation marker on a line of its own.
+func (t *transcript) store(b []byte) {
+	if t.truncated || len(b) == 0 {
+		return
+	}
+	if t.written+int64(len(b)) > t.max {
+		t.truncated = true
+		marker := truncationMarker
+		if t.midLine {
+			marker = "\n" + marker
+		}
+		if _, err := io.WriteString(t.out, marker); err != nil && t.werr == nil {
+			t.werr = err
+		}
+		return
+	}
+	if _, err := t.out.Write(b); err != nil && t.werr == nil {
+		t.werr = err
+	}
+	t.written += int64(len(b))
+	t.midLine = b[len(b)-1] != '\n'
 }
 
 func (t *transcript) parse(line []byte) {
@@ -134,24 +176,16 @@ func (t *transcript) parse(line []byte) {
 	if err := json.Unmarshal(line, &ev); err != nil {
 		return
 	}
-	t.started = true
 	switch ev.Type {
 	case "result":
 		t.result = &ev
 	case "rate_limit_event":
-		if ri := ev.RateLimitInfo; ri != nil {
-			// A later "allowed" does not clear the flag: it is only used
-			// when the pass ends without a usable result.
-			if ri.Status == "rejected" {
-				t.rejected = true
-				t.rejectedReset = ri.ResetsAt
-			}
-		}
-	case "assistant":
-		// VERIFY: an assistant message that stands for an API error carries
-		// "error":"rate_limit"|"billing_error"|"authentication_failed"|... .
-		if s := rawString(ev.Error); s != "" {
-			t.assistantError = s
+		// A mid-stream event is never a quota outcome by itself (an injected
+		// agent can print one). Only a "rejected" window is remembered, and
+		// only for its reset time; "allowed" and "allowed_warning" are
+		// ordinary progress events.
+		if ri := ev.RateLimitInfo; ri != nil && ri.Status == "rejected" {
+			t.rejectedReset = ri.ResetsAt
 		}
 	}
 }
@@ -183,8 +217,9 @@ func rawString(raw json.RawMessage) string {
 // strings of claude 2.1.327 ("usage limit reached", "You've hit your session
 // limit", "You're out of usage credits", "resets at 3pm") and from the older
 // "Claude AI usage limit reached|<unix>" form; none was observed live. They
-// are only applied to error text produced by the CLI itself (an error result,
-// an assistant-level error tag, stderr), never to tool output or model text.
+// are only applied to the text of the CLI's final error result (and, for the
+// reset time alone, to stderr once that result says quota), never to tool
+// output, model text or mid-stream events.
 var (
 	quotaTextRE  = regexp.MustCompile(`(?i)usage limit|hit your [a-z0-9' -]{0,40}limit|reached your [a-z0-9' -]{0,40}limit|limit reached|out of (extra )?usage|rate[ _-]?limit|too many requests|\b429\b`)
 	resetEpochRE = regexp.MustCompile(`(?i)limit reached\|(\d{9,13})`)
@@ -193,9 +228,10 @@ var (
 
 func looksLikeQuota(text string) bool { return quotaTextRE.MatchString(text) }
 
-// maxResetAhead rejects absurd reset times (the longest window is weekly;
-// spend limits are monthly).
-const maxResetAhead = 32 * 24 * time.Hour
+// maxResetAhead bounds the reset time the launcher reports: a reset in the
+// past or more than 24h ahead is returned as zero (unknown), so a forged
+// reset cannot park a seat for long. The core applies its own cap on top.
+const maxResetAhead = 24 * time.Hour
 
 func fromEpoch(v int64, now time.Time) time.Time {
 	if v <= 0 {

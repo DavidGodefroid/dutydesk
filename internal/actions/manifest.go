@@ -88,9 +88,25 @@ type paramFile struct {
 
 // LoadAction loads and validates one action directory (action.yaml next
 // to its script). The action is named after the directory; a "name" key,
-// when present, must agree. Errors name the manifest field.
+// when present, must agree. The directory, the manifest and the script are
+// checked with Lstat: a symbolic link is refused. Errors name the manifest
+// field.
 func LoadAction(dir string) (model.Action, error) {
 	name := filepath.Base(filepath.Clean(dir))
+	// Lstat everywhere: neither the directory, the manifest nor the script
+	// may be a symbolic link (or anything but a directory / regular file).
+	if st, err := os.Lstat(dir); err != nil {
+		return model.Action{}, err
+	} else if st.Mode()&os.ModeSymlink != 0 {
+		return model.Action{}, errors.New("the action directory is a symbolic link")
+	} else if !st.IsDir() {
+		return model.Action{}, errors.New("not a directory")
+	}
+	if st, err := os.Lstat(filepath.Join(dir, ManifestName)); err != nil {
+		return model.Action{}, err
+	} else if !st.Mode().IsRegular() {
+		return model.Action{}, fmt.Errorf("%s: not a regular file (a symbolic link is refused)", ManifestName)
+	}
 	data, err := os.ReadFile(filepath.Join(dir, ManifestName))
 	if err != nil {
 		return model.Action{}, err
@@ -126,12 +142,12 @@ func LoadAction(dir string) (model.Action, error) {
 	if err := ValidateAction(a); err != nil {
 		return model.Action{}, fmt.Errorf("%s: %w", ManifestName, err)
 	}
-	st, err := os.Stat(filepath.Join(dir, a.Script))
+	st, err := os.Lstat(filepath.Join(dir, a.Script))
 	switch {
 	case err != nil:
 		return model.Action{}, fmt.Errorf("%s: script: %q not found in the action directory", ManifestName, a.Script)
 	case !st.Mode().IsRegular():
-		return model.Action{}, fmt.Errorf("%s: script: %q is not a regular file", ManifestName, a.Script)
+		return model.Action{}, fmt.Errorf("%s: script: %q is not a regular file (a symbolic link is refused)", ManifestName, a.Script)
 	case st.Mode().Perm()&0o111 == 0:
 		return model.Action{}, fmt.Errorf("%s: script: %q is not executable", ManifestName, a.Script)
 	}
@@ -253,19 +269,19 @@ func ValidateAction(a model.Action) error {
 }
 
 // ValidatePattern enforces the rule for string parameter patterns, so that
-// a pattern can provably never match "/", whitespace or a control
-// character:
+// a pattern can provably never match a character outside SafeValueClass
+// (no shell metacharacter, quote, "/", whitespace or control character):
 //
 //   - the pattern is anchored: it starts with ^ and ends with $, once, at
 //     the top level (so "^a$|^b$" is refused; write "^(a|b)$");
 //   - between the anchors, only literals, character classes, groups,
 //     alternation and repetition (? * + {n,m});
-//   - every literal and every character class holds only printable ASCII
-//     (0x21-0x7E) other than "/". That refuses ".", negated classes,
-//     \s \S \D \W, Unicode classes, and (?i) on a class with letters.
+//   - every literal and every character class holds only characters of
+//     SafeValueClass. That refuses ".", negated classes, \s \S \D \W,
+//     Unicode classes, and (?i) on a class with letters.
 //
-// The check walks the parsed expression, so escapes and ranges that hide a
-// "/" ("[+-9]") are refused as well.
+// The check walks the parsed expression, so escapes and ranges that hide
+// another character ("[+-9]" holds "," and "/") are refused as well.
 func ValidatePattern(pattern string) error {
 	re, err := syntax.Parse(pattern, syntax.Perl)
 	if err != nil {
@@ -286,21 +302,26 @@ func ValidatePattern(pattern string) error {
 	return nil
 }
 
-func safeRune(r rune) bool { return r >= 0x21 && r <= 0x7E && r != '/' }
+func safeRune(r rune) bool { return r >= 0 && r < 0x80 && safeByte(byte(r)) }
 
 func walkPattern(re *syntax.Regexp) error {
 	switch re.Op {
 	case syntax.OpLiteral:
 		for _, r := range re.Rune {
 			if !safeRune(r) {
-				return errors.New("a literal may only be printable ASCII other than \"/\" (no whitespace)")
+				return errors.New("a literal may only hold characters of " + SafeValueClass)
 			}
 		}
 	case syntax.OpCharClass:
 		for i := 0; i+1 < len(re.Rune); i += 2 {
 			lo, hi := re.Rune[i], re.Rune[i+1]
-			if lo < 0x21 || hi > 0x7E || (lo <= '/' && '/' <= hi) {
-				return errors.New("a character class may only hold printable ASCII other than \"/\" (no negated class, \\s, \\S, \\W, \\D, or range crossing \"/\")")
+			if lo < 0x21 || hi > 0x7E {
+				return errors.New("a character class may only hold characters of " + SafeValueClass + " (no negated class, \\s, \\S, \\W, \\D)")
+			}
+			for r := lo; r <= hi; r++ {
+				if !safeRune(r) {
+					return errors.New("a character class may only hold characters of " + SafeValueClass + " (a range must not cross another character)")
+				}
 			}
 		}
 	case syntax.OpConcat, syntax.OpAlternate, syntax.OpCapture,

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -16,7 +17,10 @@ const MaxFrames = 30
 // The Sentry adapter reads the webhooks of Sentry's integration platform:
 // resource "issue" (actions created, resolved, ...) and resource
 // "event_alert" (action triggered). The structs below ARE the allow-list:
-// what they do not name is never decoded. Left out on purpose: title,
+// what they do not name is never decoded, and what they name is kept only
+// through a filter of sanitise.go (the application words the culprit, the
+// exception type, the file and the function: see there). Left out on
+// purpose: title,
 // message, metadata.value (the exception message), exception value, frame
 // variables and source context, request, user, tags, breadcrumbs,
 // contexts, the actor, URLs.
@@ -73,7 +77,7 @@ type sentryFrame struct {
 
 // sentry turns a verified Sentry delivery into a signal, a resolution, or
 // errIgnored.
-func sentry(body []byte, resource string) (delivery, error) {
+func sentry(body []byte, resource, source string) (delivery, error) {
 	var p sentryPayload
 	if err := json.Unmarshal(body, &p); err != nil {
 		return delivery{}, errors.New("the body is not the JSON of a Sentry webhook")
@@ -93,7 +97,7 @@ func sentry(body []byte, resource string) (delivery, error) {
 		if p.Data.Issue == nil {
 			return delivery{}, errors.New("issue webhook without data.issue")
 		}
-		return sentryIssueDelivery(p.Action, p.Data.Issue)
+		return sentryIssueDelivery(p.Action, p.Data.Issue, source)
 	case "event_alert":
 		if p.Action != "triggered" {
 			return delivery{}, errIgnored
@@ -101,13 +105,13 @@ func sentry(body []byte, resource string) (delivery, error) {
 		if p.Data.Event == nil {
 			return delivery{}, errors.New("event alert without data.event")
 		}
-		return sentryEventDelivery(p.Data.Event)
+		return sentryEventDelivery(p.Data.Event, source)
 	}
 	// installation, comment, metric_alert, error, seer...: not followed.
 	return delivery{}, errIgnored
 }
 
-func sentryIssueDelivery(action string, is *sentryIssue) (delivery, error) {
+func sentryIssueDelivery(action string, is *sentryIssue, source string) (delivery, error) {
 	id, err := issueID(is.ID)
 	if err != nil {
 		return delivery{}, err
@@ -122,34 +126,34 @@ func sentryIssueDelivery(action string, is *sentryIssue) (delivery, error) {
 		return delivery{}, errIgnored
 	}
 	f := map[string]string{"issue_id": id}
-	put(f, "project", is.Project.Slug)
-	put(f, "short_id", is.ShortID)
-	put(f, "exception_type", is.Metadata.Type)
-	put(f, "culprit", is.Culprit)
-	put(f, "file", is.Metadata.Filename)
-	put(f, "function", is.Metadata.Function)
-	put(f, "level", is.Level)
+	put(f, "project", strictIdent(is.Project.Slug))
+	put(f, "short_id", strictIdent(is.ShortID))
+	put(f, "exception_type", freeText(is.Metadata.Type))
+	put(f, "culprit", freeText(is.Culprit))
+	put(f, "file", freeText(is.Metadata.Filename))
+	put(f, "function", freeText(is.Metadata.Function))
+	put(f, "level", sentryLevel(is.Level))
 	put(f, "count", number(is.Count))
 	put(f, "user_count", number(is.UserCount))
-	put(f, "first_seen", is.FirstSeen)
-	put(f, "last_seen", is.LastSeen)
-	return delivery{signal: &model.Signal{Fingerprint: fp, Summary: sentrySummary(f), Fields: f}}, nil
+	put(f, "first_seen", timestamp(is.FirstSeen))
+	put(f, "last_seen", timestamp(is.LastSeen))
+	return delivery{signal: &model.Signal{Fingerprint: fp, Summary: sentrySummary(source, id), Fields: f}}, nil
 }
 
-func sentryEventDelivery(ev *sentryEvent) (delivery, error) {
+func sentryEventDelivery(ev *sentryEvent, source string) (delivery, error) {
 	id, err := issueID(ev.IssueID)
 	if err != nil {
 		return delivery{}, err
 	}
 	f := map[string]string{"issue_id": id}
 	put(f, "project_id", number(ev.Project))
-	put(f, "culprit", ev.Culprit)
-	put(f, "level", ev.Level)
-	put(f, "last_seen", ev.Datetime)
+	put(f, "culprit", freeText(ev.Culprit))
+	put(f, "level", sentryLevel(ev.Level))
+	put(f, "last_seen", timestamp(ev.Datetime))
 	if vals := ev.Exception.Values; len(vals) > 0 {
 		// The last value is the exception that was raised last.
 		last := vals[len(vals)-1]
-		put(f, "exception_type", last.Type)
+		put(f, "exception_type", freeText(last.Type))
 		frames := last.Stacktrace.Frames
 		if len(frames) > MaxFrames {
 			// Sentry lists frames oldest call first: keep the innermost.
@@ -161,7 +165,7 @@ func sentryEventDelivery(ev *sentryEvent) (delivery, error) {
 			if file == "" {
 				file = fr.Module
 			}
-			lines = append(lines, fmt.Sprintf("%s:%s:%s", clean(file), clean(fr.Function), number(fr.Lineno)))
+			lines = append(lines, fmt.Sprintf("%s:%s:%s", freeText(file), freeText(fr.Function), number(fr.Lineno)))
 		}
 		if len(lines) > 0 {
 			// One frame per line, "file:function:line", innermost last.
@@ -169,28 +173,15 @@ func sentryEventDelivery(ev *sentryEvent) (delivery, error) {
 			f["frames"] = strconv.Itoa(len(lines))
 		}
 	}
-	return delivery{signal: &model.Signal{Fingerprint: "sentry:" + id, Summary: sentrySummary(f), Fields: f}}, nil
+	return delivery{signal: &model.Signal{Fingerprint: "sentry:" + id, Summary: sentrySummary(source, id), Fields: f}}, nil
 }
 
-// sentrySummary is built from allow-listed fields only, never from the
-// issue's title.
-func sentrySummary(f map[string]string) string {
-	s := "Sentry"
-	if v := f["level"]; v != "" {
-		s += " " + v
-	}
-	if v := f["exception_type"]; v != "" {
-		s += ": " + v
-	}
-	if v := f["culprit"]; v != "" {
-		s += " in " + v
-	}
-	if v := f["short_id"]; v != "" {
-		s += " (" + v + ")"
-	} else {
-		s += " (issue " + f["issue_id"] + ")"
-	}
-	return s
+// sentrySummary names the webhook and the issue, nothing else: the core
+// puts the summary in the titles of its alerts, and the source id comes
+// from the configuration and the issue id passed issueID. What the
+// application words (culprit, exception type, ...) is in Fields only.
+func sentrySummary(source, id string) string {
+	return "Sentry " + source + ": issue " + id
 }
 
 // issueID reads an issue id, a string or a number in the payload. It is
@@ -210,14 +201,17 @@ func issueID(raw json.RawMessage) (string, error) {
 	return id, nil
 }
 
-// number keeps raw only when it is a number, or a string holding one.
+// number keeps raw only when it is a plain decimal number, or a string
+// holding one.
 func number(raw json.RawMessage) string {
 	s := scalar(raw)
-	if _, err := strconv.ParseFloat(s, 64); err != nil {
+	if len(s) > 32 || !plainNumber.MatchString(s) {
 		return ""
 	}
 	return s
 }
+
+var plainNumber = regexp.MustCompile(`^-?[0-9]+(\.[0-9]+)?$`)
 
 // scalar renders a JSON string or number; anything else is "".
 func scalar(raw json.RawMessage) string {
@@ -238,8 +232,9 @@ func scalar(raw json.RawMessage) string {
 	return n.String()
 }
 
+// put keeps a value that went through a filter and is not empty.
 func put(f map[string]string, k, v string) {
-	if v = clean(v); v != "" {
+	if v != "" {
 		f[k] = v
 	}
 }

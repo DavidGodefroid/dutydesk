@@ -1,7 +1,13 @@
 package forge
 
 import (
+	"context"
 	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -109,21 +115,107 @@ func TestPatternsAvoidObviousFalsePositives(t *testing.T) {
 	}
 }
 
+func TestLiteralSecretReversedAndHex(t *testing.T) {
+	secret := "seat-token-abcdefghijklmnop"
+	rev := []byte(secret)
+	for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+		rev[i], rev[j] = rev[j], rev[i]
+	}
+	low := hex.EncodeToString([]byte(secret))
+	for name, l := range map[string]string{
+		"reversed":  "v=" + string(rev) + ";",
+		"hex lower": "v=" + low + ";",
+		"hex upper": "v=0x" + strings.ToUpper(low) + ";",
+	} {
+		s := newScanner([]string{secret})
+		s.line("f", 1, []byte(l))
+		if len(s.findings) != 1 || !strings.Contains(s.findings[0], "known-secret") {
+			t.Errorf("%s form not found: %v", name, s.findings)
+		}
+	}
+	s := newScanner([]string{secret})
+	s.line("f", 1, []byte("v="+low[:len(low)-2]+" and "+string(rev[1:])))
+	if len(s.findings) != 0 {
+		t.Errorf("false positive: %v", s.findings)
+	}
+}
+
 func TestSymlinkEscapes(t *testing.T) {
 	for _, tc := range []struct {
-		name, target string
-		want         bool
+		name  string
+		links map[string]string
+		want  bool
 	}{
-		{"a/link", "../b", false},
-		{"a/link", "../../b", true},
-		{"link", "..", true},
-		{"link", "a/../../x", true},
-		{"link", "/abs", true},
-		{"a/b/link", "../../c/d", false},
-		{"link", "", true},
+		{"a/link", map[string]string{"a/link": "../b"}, false},
+		{"a/link", map[string]string{"a/link": "../../b"}, true},
+		{"link", map[string]string{"link": ".."}, true},
+		{"link", map[string]string{"link": "a/../../x"}, true},
+		{"link", map[string]string{"link": "/abs"}, true},
+		{"a/b/link", map[string]string{"a/b/link": "../../c/d"}, false},
+		{"link", map[string]string{"link": ""}, true},
+		{"link", map[string]string{"link": "a\x00b"}, true},
+		{"dir/link", map[string]string{"dir/link": "../other/file"}, false},
+		// Chains.
+		{"a", map[string]string{"a": "b", "b": "../../etc"}, true},
+		{"a", map[string]string{"a": "b", "b": "/etc"}, true},
+		{"a", map[string]string{"a": "b", "b": "c", "c": "src/x"}, false},
+		{"a", map[string]string{"a": "d/e/f", "d": "x/y"}, false},
+		// Lexically inside, outside once p/r is followed.
+		{"p/q/l", map[string]string{"p/q/l": "../r/../../x"}, false},
+		{"p/q/l", map[string]string{"p/q/l": "../r/../../x", "p/r": ".."}, true},
+		{"l", map[string]string{"l": "deep/../../x", "deep": "a/b"}, false},
+		// Loops and long chains cannot be resolved safely.
+		{"a", map[string]string{"a": "b", "b": "a"}, true},
+		{"a", map[string]string{"a": "a"}, true},
+		{"a", map[string]string{"a": "a/x"}, true},
 	} {
-		if got := symlinkEscapes(tc.name, tc.target); got != tc.want {
-			t.Errorf("symlinkEscapes(%q, %q) = %v", tc.name, tc.target, got)
+		if got, _ := symlinkEscapes(tc.links, tc.name); got != tc.want {
+			t.Errorf("symlinkEscapes(%v, %q) = %v", tc.links, tc.name, got)
 		}
+	}
+	long := map[string]string{}
+	for i := 0; i < maxLinkHops+5; i++ {
+		long[fmt.Sprintf("l%d", i)] = fmt.Sprintf("l%d", i+1)
+	}
+	if got, _ := symlinkEscapes(long, "l0"); !got {
+		t.Error("a chain longer than the hop limit was accepted")
+	}
+	if got, _ := symlinkEscapes(long, fmt.Sprintf("l%d", maxLinkHops)); got {
+		t.Error("a short chain was refused")
+	}
+	_, via := symlinkEscapes(map[string]string{"a": "b", "b": "c/d", "c": "x"}, "a")
+	if strings.Join(via, " ") != "a b c" {
+		t.Errorf("followed links: %v", via)
+	}
+}
+
+func TestMeasureTree(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	write(t, filepath.Join(outside, "big"), strings.Repeat("x", 5000))
+	write(t, filepath.Join(root, "a.txt"), strings.Repeat("x", 100))
+	write(t, filepath.Join(root, "d", "b.txt"), strings.Repeat("x", 100))
+	write(t, filepath.Join(root, ".git", "objects", "pack"), strings.Repeat("x", 9000))
+	if err := os.Symlink(outside, filepath.Join(root, "out")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "big"), filepath.Join(root, "bigl")); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	// 5 entries (a.txt, d, d/b.txt, out, bigl), 200 bytes: links are not followed, the top .git is not counted.
+	if err := measureTree(ctx, root, 5, 200); err != nil {
+		t.Fatalf("tree within the caps refused: %v", err)
+	}
+	if err := measureTree(ctx, root, 4, 200); !errors.Is(err, ErrTooLarge) || !strings.Contains(err.Error(), "MaxTreeFiles") {
+		t.Fatalf("too many files: %v", err)
+	}
+	if err := measureTree(ctx, root, 5, 199); !errors.Is(err, ErrTooLarge) || !strings.Contains(err.Error(), "MaxTreeBytes") {
+		t.Fatalf("too many bytes: %v", err)
+	}
+	// A nested .git is part of what git would walk.
+	write(t, filepath.Join(root, "d", ".git", "x"), "x")
+	if err := measureTree(ctx, root, 5, 200); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("nested .git not counted: %v", err)
 	}
 }

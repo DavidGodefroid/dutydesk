@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -65,6 +66,13 @@ type Config struct {
 	KillGrace         time.Duration // wait after `kill` before killing the client; default 10s
 	TempDir           string        // where the 0600 env-file lives; default os.TempDir()
 
+	// MaxTranscriptBytes caps the transcript the launcher writes to OutDir
+	// (the agent decides how much it prints). 0 = DefaultMaxTranscriptBytes
+	// (20 MiB). At the cap one truncation marker line is written and the
+	// file stops growing; the pass continues and the stream is still parsed,
+	// so a verdict that arrives later is honoured.
+	MaxTranscriptBytes int64
+
 	Tokens TokenSource      // required
 	Runner Runner           // default ExecRunner{}
 	Now    func() time.Time // default time.Now
@@ -122,6 +130,12 @@ func NewLauncher(cfg Config) (*Launcher, error) {
 	if cfg.KillGrace <= 0 {
 		cfg.KillGrace = 10 * time.Second
 	}
+	if cfg.MaxTranscriptBytes < 0 {
+		return nil, errors.New("agent: MaxTranscriptBytes must not be negative")
+	}
+	if cfg.MaxTranscriptBytes == 0 {
+		cfg.MaxTranscriptBytes = DefaultMaxTranscriptBytes
+	}
 	if cfg.Runner == nil {
 		cfg.Runner = ExecRunner{}
 	}
@@ -145,9 +159,10 @@ const structuredOutputTool = "StructuredOutput"
 const permissionMode = "dontAsk"
 
 var (
-	nameRE     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
-	mcpNameRE  = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-	unsafeName = regexp.MustCompile(`[^a-z0-9_.-]+`)
+	nameRE      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+	mcpNameRE   = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+	unsafeName  = regexp.MustCompile(`[^a-z0-9_.-]+`)
+	containerRE = regexp.MustCompile(`^` + ContainerPrefix + `[a-z0-9_.-]+$`)
 )
 
 // ContainerPrefix starts the name of every agent container.
@@ -156,11 +171,91 @@ const ContainerPrefix = "dutydesk-"
 // ContainerName is the name of the container of pass number run (1-based,
 // unique per incident, quota retries included) of an incident.
 func ContainerName(inc model.Incident, run int) string {
-	id := strings.Trim(unsafeName.ReplaceAllString(strings.ToLower(inc.ID), "-"), "-.")
+	return ContainerNameFor(inc.ID, run)
+}
+
+// ContainerNameFor is ContainerName from the incident id alone: the name of
+// the container of pass number run of that incident. The core uses it to
+// remove the container of an incident that left "investigating".
+func ContainerNameFor(incidentID string, run int) string {
+	id := strings.Trim(unsafeName.ReplaceAllString(strings.ToLower(incidentID), "-"), "-.")
 	if id == "" {
 		id = "incident"
 	}
 	return fmt.Sprintf("%s%s-%d", ContainerPrefix, id, run)
+}
+
+// RemoveContainer force-removes an agent container and verifies that it is
+// gone: `<runtime> rm -f <name>`, then `<runtime> inspect --type container
+// <name>`. It returns nil only when the inspection proves the container no
+// longer exists (non-zero exit with the runtime's "no such ..." answer). Any
+// other outcome is an error: the container may still be there, and so may
+// what it holds (the seat token, the lock sockets).
+//
+// The exit code of `rm -f` is not trusted either way: a container started
+// with --rm is usually gone already. ctx must be alive and bounded: after a
+// pass that was cancelled or timed out, give a fresh context, never the pass
+// context. name must be an agent container name (ContainerName); anything
+// else is refused, so the helper cannot remove a foreign container.
+func RemoveContainer(ctx context.Context, r Runner, runtime, name string) error {
+	if !containerRE.MatchString(name) {
+		return fmt.Errorf("agent: %q is not an agent container name", name)
+	}
+	if r == nil {
+		r = ExecRunner{}
+	}
+	if runtime == "" {
+		runtime = "podman"
+	}
+	rmOut := &tailBuffer{max: 512}
+	if _, err := r.Run(ctx, Command{Name: runtime, Args: []string{"rm", "-f", name}, Stdout: rmOut, Stderr: rmOut}); err != nil {
+		return fmt.Errorf("agent: remove container %s: %s", name, short(err.Error()))
+	}
+	out := &tailBuffer{max: 2048}
+	code, err := r.Run(ctx, Command{Name: runtime, Args: []string{"inspect", "--type", "container", name}, Stdout: out, Stderr: out})
+	if err != nil {
+		return fmt.Errorf("agent: inspect container %s: %s", name, short(err.Error()))
+	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("agent: inspect container %s: %v", name, ctx.Err())
+	}
+	if code == 0 {
+		return fmt.Errorf("agent: container %s still exists after rm -f (%s)", name, short(rmOut.String()))
+	}
+	if !strings.Contains(strings.ToLower(out.String()), "no such") {
+		return fmt.Errorf("agent: cannot tell whether container %s is gone: inspect exited with code %d: %s", name, code, short(out.String()))
+	}
+	return nil
+}
+
+// Removal of the container after a pass: a few attempts (the runtime may
+// still be tearing a --rm container down), all within one bounded context.
+const (
+	removeAttempts = 3
+	removeTimeout  = 45 * time.Second
+)
+
+var removeRetryDelay = 500 * time.Millisecond
+
+// cleanup removes the container of a finished pass and returns "" when it is
+// verified gone, else its name (RunResult.Leftover).
+func (l *Launcher) cleanup(name string) string {
+	// A fresh context: the pass context may be cancelled or expired.
+	ctx, cancel := context.WithTimeout(context.Background(), removeTimeout)
+	defer cancel()
+	for i := 0; i < removeAttempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return name
+			case <-time.After(removeRetryDelay):
+			}
+		}
+		if RemoveContainer(ctx, l.cfg.Runner, l.cfg.Runtime, name) == nil {
+			return ""
+		}
+	}
+	return name
 }
 
 // ClaudeArgs returns the arguments given to the image entrypoint (claude).
@@ -452,7 +547,7 @@ func (l *Launcher) Run(ctx context.Context, req model.RunRequest) model.RunResul
 	if err != nil {
 		return fail("transcript: %v", err)
 	}
-	tr := newTranscript(tf, secrets...)
+	tr := newTranscript(tf, l.cfg.MaxTranscriptBytes, secrets...)
 	stderr := &tailBuffer{max: 4096}
 
 	timeout := l.cfg.DefaultRunTimeout
@@ -505,13 +600,22 @@ func (l *Launcher) Run(ctx context.Context, req model.RunRequest) model.RunResul
 		werr = cerr
 	}
 
+	// However the pass ended, its container must not outlive it: it holds
+	// the seat token and the lock sockets. --rm is not relied upon. The only
+	// case skipped is a runtime binary that could not be executed at all: no
+	// container was ever created.
+	leftover := ""
+	if !neverExecuted(ex.err) {
+		leftover = l.cleanup(ContainerName(req.Incident, req.Run))
+	}
+
 	res := l.interpret(tr, ex.code, ex.err, stderr.String(), stopped, timeout)
 	if res.Status == model.RunOK && werr != nil {
 		// The verdict is valid; a truncated transcript is not worth a failed pass.
 		res.Error = "transcript incomplete: " + werr.Error()
 	}
 	if res.Verdict != nil {
-		if err := writeVerdict(filepath.Join(req.OutDir, "verdict.json"), res.Verdict); err != nil {
+		if err := writeVerdict(filepath.Join(req.OutDir, "verdict.json"), res.Verdict, maxVerdictFileBytes); err != nil {
 			res = model.RunResult{
 				Status: model.RunFailed, Error: "verdict file: " + err.Error(),
 				CostUSD: res.CostUSD, Turns: res.Turns, InputTok: res.InputTok, OutputTok: res.OutputTok,
@@ -519,7 +623,14 @@ func (l *Launcher) Run(ctx context.Context, req model.RunRequest) model.RunResul
 		}
 	}
 	res.Error = redact(res.Error, secrets)
+	res.Leftover = leftover
 	return res
+}
+
+// neverExecuted tells whether the Runner failed because the runtime binary
+// could not be executed (missing, not executable).
+func neverExecuted(err error) bool {
+	return err != nil && (errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission))
 }
 
 // kill stops the container, best effort. It uses a fresh context: the pass
@@ -585,15 +696,10 @@ func (l *Launcher) interpret(tr *transcript, code int, runErr error, stderr stri
 	if r != nil {
 		errText = strings.TrimSpace(rawString(r.Result) + " " + rawString(r.Errors))
 	}
-	quota := tr.rejected ||
-		tr.assistantError == "rate_limit" || tr.assistantError == "billing_error" ||
-		(r != nil && r.IsError && r.APIErrorStatus != nil && *r.APIErrorStatus == 429) ||
-		(r != nil && r.IsError && looksLikeQuota(errText)) ||
-		// stderr only counts once claude itself has produced output, so a
-		// registry "pull rate limit" is not taken for an exhausted seat.
-		(r == nil && tr.started && looksLikeQuota(stderr))
-	if quota {
+	if quotaResult(r, errText) {
 		res.Status = model.RunQuota
+		// The rate_limit_event only supplies the reset time; both sources
+		// are clamped (past or more than 24h ahead = unknown).
 		res.QuotaReset = fromEpoch(tr.rejectedReset, now)
 		if res.QuotaReset.IsZero() {
 			res.QuotaReset = resetFromText(errText+" "+stderr, now)
@@ -625,12 +731,36 @@ func (l *Launcher) interpret(tr *transcript, code int, runErr error, stderr stri
 	return res
 }
 
+// quotaResult tells whether the CLI's own final outcome is a usage-limit
+// error. The whole stream is attacker-controlled (prompt injection), so the
+// rule is strict: the LAST result event must be an error result, and that
+// result must be recognisably a usage limit (HTTP 429, or the limit wording
+// in its own text). A mid-stream rate_limit_event, an assistant-level error
+// tag, stderr or the exit code never make a quota outcome: without such a
+// final result the pass is RunFailed (or RunOK when the final result is a
+// valid success). Endings that are known not to be a limit (max turns, max
+// budget, structured-output retries) are never quota, whatever their text.
+func quotaResult(r *streamEvent, errText string) bool {
+	if r == nil || !(r.IsError || strings.HasPrefix(r.Subtype, "error")) {
+		return false
+	}
+	switch r.Subtype {
+	case "error_max_turns", "error_max_budget_usd", "error_max_structured_output_retries":
+		return false
+	}
+	if r.APIErrorStatus != nil && *r.APIErrorStatus == 429 {
+		return true
+	}
+	return looksLikeQuota(errText)
+}
+
 // verdictBytes picks the verdict out of a success result: the structured
 // output when present, else the result text (bare JSON or one fenced block).
 func verdictBytes(r *streamEvent) []byte {
 	if so := bytes.TrimSpace(r.StructuredOutput); len(so) > 0 && !bytes.Equal(so, []byte("null")) {
-		// VERIFY: structured_output is the JSON value itself (an object).
-		// A JSON string holding the object is accepted too.
+		// structured_output is the JSON value itself, an object (confirmed on
+		// claude 2.1.327, testdata/real-2.1.327.jsonl). A JSON string holding
+		// the object is accepted too.
 		if so[0] == '"' {
 			var s string
 			if json.Unmarshal(so, &s) == nil {
@@ -649,10 +779,19 @@ func verdictBytes(r *streamEvent) []byte {
 	return []byte(text)
 }
 
-func writeVerdict(path string, v *model.Verdict) error {
+// maxVerdictFileBytes bounds verdict.json. A verdict that passed
+// ParseVerdict is far smaller (its fields are length-checked, about 120 000
+// code points in all); the cap keeps the file bounded even if a bound is
+// loosened one day.
+const maxVerdictFileBytes = 1 << 20
+
+func writeVerdict(path string, v *model.Verdict, max int) error {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
+	}
+	if len(b)+1 > max {
+		return fmt.Errorf("verdict is %d bytes, over the %d bytes limit", len(b)+1, max)
 	}
 	return os.WriteFile(path, append(b, '\n'), 0o600)
 }

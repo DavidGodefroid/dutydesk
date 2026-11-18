@@ -30,20 +30,44 @@ from the file's directory.
 | `seats[].name`, `.token_file`, `.max_parallel`, `.expires_on` | Claude subscription seats | at least one; 1 pass per seat |
 | `max_parallel_runs` | agent passes at once, all projects | sum of the seats |
 | `claude_model` | `claude --model` | CLI default |
+| `quota_cap` | longest time a seat may stay marked exhausted, whatever reset time a pass reports; `10m` to `24h` | `5h` |
+| `retention.transcripts` | transcripts of resolved incidents are pruned after this; at least `1h` | `720h` (30 days) |
+| `retention.incidents` | dossiers and rows of resolved incidents are pruned after this; never shorter than `retention.transcripts` | `4320h` (180 days) |
 | `heartbeat.url`, `.every` | dead-man switch ping while healthy | off; `1m` |
 | `agent.network` | pre-created **internal** container network | required |
 | `agent.https_proxy`, `agent.no_proxy` | egress proxy as seen from that network | none |
 | `agent.mcp_config` | host path of the MCP config mounted at `/etc/dutydesk/mcp.json` | required |
 | `agent.extra_mounts[]` | `host:container[:ro\|rw]`: lock client binaries and sockets | none; read-only |
 | `agent.user` | numeric `uid[:gid]` in the container, never root | `10001:10001` |
-| `agent.run_args[]` | extra `run` flags (`--userns=…`); isolation flags are refused | none |
+| `agent.run_args[]` | extra `run` flags, from an allow-list (below) | none |
 | `agent.memory`, `agent.cpus`, `agent.pids_limit` | container limits | `4g`, `2`, `512` |
+| `agent.max_transcript_bytes` | transcript kept of one pass, in bytes; 64 KiB to 1 GiB | `20971520` (20 MiB) |
 | `lock_clients.sql_plan`, `.sql_run`, `.log_mcp` | argv templates of the lock clients used by checks; `{instance}`, `{plan_id}` | the launchers lox installs |
 | `lock_clients.env`, `.timeout` | extra environment; bound of one lock call | none; `30s` |
 
 `agent.mcp_config` and `agent.extra_mounts` accept `{project}`, `{runbook}`,
 `{action_instance}`, `{ask_instance}` and `{incident}`: give each runbook its
 own MCP file so that a pass only sees the lockssh profiles of its runbook.
+
+Durations are Go durations (`20m`, `168h`); a leading number of days is
+accepted too (`30d`, `1d12h`; a day is 24 hours).
+
+`agent.run_args` is an allow-list. Each entry is one `--flag=value`
+argument (never a `--flag value` pair over two entries), one of:
+
+- `--userns=keep-id` or `--userns=keep-id:<options>` (options made of
+  `[a-z0-9=,]`, e.g. `uid=10001,gid=10001`);
+- `--security-opt=label=disable`, `label=type:<t>`, `label=level:<l>`,
+  `label=user:<u>` or `label=role:<r>`: SELinux labels only. `seccomp=`,
+  `apparmor=`, `no-new-privileges`, `unmask=`, `label=nested` and every
+  other security option are refused;
+- `--annotation=<key>=<value>` and `--label=<key>=<value>`: key of letters,
+  digits and `._/-`, value of letters, digits and `._:@,+-`; keys in a
+  namespace the container runtime acts upon (`run.oci.`, `io.podman.`,
+  `io.containers.`, `io.kubernetes.`, …) are refused.
+
+Anything else (`--privileged`, `--cap-add`, `--pid`, `--network`, `-v`, …)
+fails the load.
 
 ## Config repository
 
@@ -69,12 +93,15 @@ repos:                       # code repositories agents may read and patch
     project: acme/docflow
     default_branch: main
     token_file: /etc/dutydesk/secrets/gitlab-docflow.token
+    # deny_paths: [".gitlab-ci.yml", ".github/**"]   # optional, see below
+    # allow_paths: ["src/**", "tests/**"]            # optional, see below
 locks:
   workspace: /srv/locks/docflow   # directory holding .lockfamily/
   sql: docflow-db                 # locksql instance (optional: log, mq, file)
 limits: { max_open_per_check: 10, max_runs_per_incident: 6, max_incident_age: 24h,
           run_timeout: 20m, max_turns: 60, max_parallel_runs: 2, green_light_timeout: 2h,
-          queue_alert_after: 15m, recurrence_count: 3, recurrence_window: 168h, reminder_every: 24h }
+          queue_alert_after: 15m, recurrence_count: 3, recurrence_window: 168h, reminder_every: 24h,
+          max_green_lights: 3, max_quota_runs: 3 }
 alerts:
   webhook_url_file: /etc/dutydesk/secrets/docflow-alerts.url   # Teams-compatible webhook
 seats: [seat-a, seat-b]      # empty = every seat
@@ -88,7 +115,24 @@ webhooks:
 ```
 
 `green_light_timeout` is capped at 4 hours (a production ticket expires at
-the hub then).
+the hub then). `max_green_lights` (green-light rounds per incident) and
+`max_quota_runs` (passes lost to an exhausted seat per incident) are both
+3 by default, between 1 and 20; past them the incident is escalated.
+
+`repos[].deny_paths` and `repos[].allow_paths` bound what a DutyDesk merge
+request may touch in that repository. Both are lists of path globs
+anchored at the repository root: `/` separators, `*` and `?` inside one
+segment, `**` as a whole segment for any number of segments. A pattern is
+never empty or absolute and holds no `..`, no `.` segment and no backslash.
+
+- `deny_paths` absent: the built-in deny-list applies (CI definitions, git
+  plumbing files). `deny_paths: [...]` replaces it. `deny_paths: []` lifts
+  the restriction: write it only on purpose.
+- `allow_paths`, when not empty: the only paths a merge request may touch.
+
+The config repository holds regular files and directories only: a symbolic
+link anywhere under `standard/` or `projects/` (an action directory or a
+script included) fails the load and names the path.
 
 ### Checks
 
@@ -109,6 +153,14 @@ query: SELECT id AS job_id, started_at FROM jobs WHERE …
 
 Templates only know `{name}` placeholders; the literal part of the
 fingerprint is the incident **family** (recurrence, known problems).
+
+`recurrence_count` / `recurrence_window` are the pass budget of a family:
+once that many incidents of the family were resolved within the window (by
+an agent, by a cleared condition or by a human), the next one is opened
+`escalated` with an alert and no agent pass. `max_green_lights` and
+`max_quota_runs` bound the green-light rounds and the passes lost to an
+exhausted seat per incident; `max_runs` and `max_incident_age` apply to
+every path that leads to another pass.
 
 ### Runbooks
 
@@ -147,9 +199,34 @@ rate_limit: { count: 6, window: 1h }
 timeout: 60s
 ```
 
-A value never contains `/`, whitespace or a leading `-`. The command an agent
-sends is `<action_install_dir>/dutydesk-act <name> --param value …`, exactly
-what the lockssh allow rule matches.
+A value only holds characters of `[A-Za-z0-9._:@=+-]` and never starts with
+`-` or `+`: no shell metacharacter, quote, whitespace or `/`, for `int`,
+`enum` and `string` alike. An enum member or a pattern that could accept
+anything else is refused when the manifest is validated, and `dutydesk-act`
+checks every value again on the action host. The command an agent sends is
+`<action_install_dir>/dutydesk-act <name> --param value …`, exactly what the
+lockssh allow rules match.
+
+The proposed lockssh rules (`dutydesk config lockssh-rules`) are as strict
+as lockssh globs allow: one rule per enum value (the product over several
+enums, up to 16 rules per action; past that an enum falls back to a glob of
+its common prefix), and for a string the shape of its pattern
+(`doc-[0-9a-f][0-9a-f]…`), one rule per length when a bounded tail is short
+enough, else the fixed leading part followed by `*`. A glob cannot say "only
+these characters, any number of times": after a `*`, the launcher is what
+refuses the rest.
+
+Verify, for the lockssh version you deploy, that its exec path does not
+hand the argv to a shell unquoted. lockssh sends each argument single-quoted
+to the login shell of the SSH account, so nothing in an argument is read as
+shell syntax; the strict value class above is the second line of defence,
+not a reason to skip that check after a lockssh upgrade.
+
+On the action host, `dutydesk-act` runs regular files only (the catalogue,
+the action directory, `action.yaml` and the script are never followed
+through a symbolic link) and, when invoked through SSH, ignores the
+`DUTYDESK_ACTIONS_*` directory variables unless a root-owned
+`/etc/dutydesk/act.conf` holds `allow_env_overrides = true`.
 
 ### What an agent may propose
 

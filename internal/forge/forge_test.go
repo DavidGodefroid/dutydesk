@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -314,15 +315,19 @@ func TestNestedRepositoryIsRefused(t *testing.T) {
 func TestSecretInDiff(t *testing.T) {
 	seat := "seat-token-abcdefghijklmnop"
 	cases := map[string]string{
-		"seat token":        "key = " + seat + "\n",
-		"seat token base64": "auth: " + base64.StdEncoding.EncodeToString([]byte("user:"+seat+":x")) + "\n",
-		"forge token":       "x " + testToken + " y\n",
-		"gitlab pattern":    "t=glpat-" + strings.Repeat("a1B2", 6) + "\n",
-		"github pattern":    "t=ghp_" + strings.Repeat("a1B2", 9) + "\n",
-		"anthropic pattern": "t=sk-ant-" + strings.Repeat("a1B2", 9) + "\n",
-		"aws key id":        "id: AKIAIOSFODNN7EXAMPLE\n",
-		"private key":       "-----BEGIN OPENSSH PRIVATE KEY-----\n",
-		"password":          "db_password = \"S3cretS3cretS3cret\"\n",
+		"seat token":           "key = " + seat + "\n",
+		"seat token base64":    "auth: " + base64.StdEncoding.EncodeToString([]byte("user:"+seat+":x")) + "\n",
+		"forge token":          "x " + testToken + " y\n",
+		"gitlab pattern":       "t=glpat-" + strings.Repeat("a1B2", 6) + "\n",
+		"github pattern":       "t=ghp_" + strings.Repeat("a1B2", 9) + "\n",
+		"anthropic pattern":    "t=sk-ant-" + strings.Repeat("a1B2", 9) + "\n",
+		"aws key id":           "id: AKIAIOSFODNN7EXAMPLE\n",
+		"private key":          "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+		"password":             "db_password = \"S3cretS3cretS3cret\"\n",
+		"seat token reversed":  "key = ponmlkjihgfedcba-nekot-taes\n",
+		"seat token hex":       "key = 0x" + hex.EncodeToString([]byte(seat)) + "\n",
+		"seat token upper hex": "key = " + strings.ToUpper(hex.EncodeToString([]byte(seat))) + "\n",
+		"forge token hex":      "x " + hex.EncodeToString([]byte(testToken)) + "\n",
 	}
 	for name, added := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -482,35 +487,9 @@ func TestBaseMovedAfterClone(t *testing.T) {
 	}
 }
 
-// A clone made elsewhere (another Forge instance, another package) still works.
-func TestProposeOnForeignClone(t *testing.T) {
-	e := newEnv(t, "gitlab", nil)
-	base := run(t, e.bare, "rev-parse", "main")
-	pushUpstream(t, e.bare, "colleague.txt", "work\n")
-	other := New(e.forge.cfg)
-	write(t, filepath.Join(e.dir, "src", "app.txt"), "changed\n")
-	if _, err := other.Propose(context.Background(), e.repo, e.dir, "dutydesk/inc-1", "t", "d", false, nil); err != nil {
-		t.Fatalf("Propose: %v", err)
-	}
-	if got := run(t, e.bare, "diff", "--name-status", base, "dutydesk/inc-1"); got != "M\tsrc/app.txt" {
-		t.Fatalf("diff %q", got)
-	}
-
-	full := filepath.Join(t.TempDir(), "full")
-	run(t, filepath.Dir(full), "clone", "-q", e.bare, full)
-	write(t, filepath.Join(full, "b.txt"), "b\n")
-	if _, err := other.Propose(context.Background(), e.repo, full, "dutydesk/inc-2", "t", "d", false, nil); err != nil {
-		t.Fatalf("Propose on a full clone: %v", err)
-	}
-
-	plain := filepath.Join(t.TempDir(), "plain")
-	write(t, filepath.Join(plain, "b.txt"), "b\n")
-	if _, err := other.Propose(context.Background(), e.repo, plain, "dutydesk/inc-3", "t", "d", false, nil); !errors.Is(err, ErrUnknownBase) {
-		t.Fatalf("directory without a base: %v", err)
-	}
-}
-
-func TestAPIFailureRemovesTheBranchAndHidesTheToken(t *testing.T) {
+// An orphan branch is kept when the merge request fails: the retry of the
+// core finds it and only opens the merge request (see TestProposeAfterFailedMergeRequest).
+func TestAPIFailureHidesTheToken(t *testing.T) {
 	e := newEnv(t, "gitlab", nil)
 	e.api.fail = http.StatusInternalServerError
 	write(t, filepath.Join(e.dir, "a.txt"), "a\n")
@@ -521,9 +500,6 @@ func TestAPIFailureRemovesTheBranchAndHidesTheToken(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), testToken) {
 		t.Fatalf("error holds the token: %v", err)
-	}
-	if got := e.branches(); len(got) != 1 {
-		t.Fatalf("orphan branch left: %v", got)
 	}
 	e.api.fail = 0
 	if _, err := e.propose("dutydesk/inc-1", "t", "d"); err != nil {

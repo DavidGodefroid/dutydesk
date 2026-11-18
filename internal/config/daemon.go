@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -31,7 +32,26 @@ type Daemon struct {
 	Heartbeat        Heartbeat    // dead-man switch of the daemon itself
 	Agent            AgentConfig  // how the agent container is launched
 	LockClients      LockClients  // how the core calls the lock clients for its checks
+	// QuotaCap is the longest time a seat may be marked exhausted, whatever
+	// reset time the quota message of a pass claims.
+	QuotaCap  time.Duration
+	Retention Retention // pruning of resolved incidents
 }
+
+// Retention is the "retention:" block: how long what a resolved incident
+// left behind is kept. Incidents is never shorter than Transcripts.
+type Retention struct {
+	Transcripts time.Duration // transcripts of resolved incidents are pruned after this
+	Incidents   time.Duration // dossiers and rows of resolved incidents are pruned after this
+}
+
+// Defaults and bounds of the daemon knobs.
+const (
+	DefaultQuotaCap             = 5 * time.Hour        // quota_cap
+	DefaultMaxTranscriptBytes   = 20 << 20             // agent.max_transcript_bytes
+	DefaultRetentionTranscripts = 30 * 24 * time.Hour  // retention.transcripts (720h)
+	DefaultRetentionIncidents   = 180 * 24 * time.Hour // retention.incidents (4320h)
+)
 
 // AgentConfig is the "agent:" block: the container of one agent pass.
 // MCPConfig and ExtraMounts accept the placeholders {project}, {runbook},
@@ -47,6 +67,8 @@ type AgentConfig struct {
 	Memory      string   // "" = launcher default
 	CPUs        string
 	PidsLimit   int
+	// MaxTranscriptBytes bounds the transcript the core keeps of one pass.
+	MaxTranscriptBytes int64
 }
 
 // LockClients is the "lock_clients:" block. Each command is an argument
@@ -97,9 +119,14 @@ type daemonFile struct {
 		MaxParallel int    `yaml:"max_parallel"`
 		ExpiresOn   string `yaml:"expires_on"`
 	} `yaml:"seats"`
-	MaxParallelRuns int    `yaml:"max_parallel_runs"`
-	ClaudeModel     string `yaml:"claude_model"`
-	Heartbeat       struct {
+	MaxParallelRuns int      `yaml:"max_parallel_runs"`
+	ClaudeModel     string   `yaml:"claude_model"`
+	QuotaCap        duration `yaml:"quota_cap"`
+	Retention       struct {
+		Transcripts duration `yaml:"transcripts"`
+		Incidents   duration `yaml:"incidents"`
+	} `yaml:"retention"`
+	Heartbeat struct {
 		URL   string   `yaml:"url"`
 		Every duration `yaml:"every"`
 	} `yaml:"heartbeat"`
@@ -114,6 +141,8 @@ type daemonFile struct {
 		Memory      string   `yaml:"memory"`
 		CPUs        string   `yaml:"cpus"`
 		PidsLimit   int      `yaml:"pids_limit"`
+		// Pointer: 0 is out of range, not "the default".
+		MaxTranscriptBytes *int64 `yaml:"max_transcript_bytes"`
 	} `yaml:"agent"`
 	LockClients struct {
 		SQLPlan []string          `yaml:"sql_plan"`
@@ -130,11 +159,61 @@ var (
 	resourceRe = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?[a-zA-Z]{0,2}$`)
 )
 
+var (
+	runArgUsernsRe = regexp.MustCompile(`^--userns=keep-id(:[a-z0-9=,]{1,64})?$`)
+	// SELinux label options only. The value of type/level/user/role is an
+	// SELinux identifier or an MLS/MCS range ("s0:c100,c200", "s0-s0:c0.c1023").
+	runArgLabelOptRe = regexp.MustCompile(`^--security-opt=label=(disable|(type|level|user|role):[A-Za-z0-9_][A-Za-z0-9_.:,-]{0,127})$`)
+	runArgMetaRe     = regexp.MustCompile(`^--(annotation|label)=([A-Za-z0-9][A-Za-z0-9._/-]{0,127})=([A-Za-z0-9._:@,+-]{0,256})$`)
+)
+
+// runtimeMetaPrefixes are the annotation and label namespaces a container
+// runtime or engine acts upon (crun's run.oci.*, podman's io.podman.* and
+// io.containers.*, ...): metadata from this file is inert or refused.
+var runtimeMetaPrefixes = []string{
+	"run.oci.", "io.podman.", "io.containers.", "io.kubernetes.", "io.crun.", "io.docker.", "com.docker.",
+	"org.systemd.", "org.criu.", "module.wasm.", "io.katacontainers.", "dev.gvisor.",
+}
+
+// ValidateRunArg checks one agent.run_args entry against the allow-list.
+// Each entry is a single "--flag=value" argument, one of:
+//
+//	--userns=keep-id
+//	--userns=keep-id:<options made of [a-z0-9=,]>
+//	--security-opt=label=disable
+//	--security-opt=label=type:<v> | level:<v> | user:<v> | role:<v>
+//	--annotation=<key>=<value>
+//	--label=<key>=<value>
+//
+// Nothing else: no other flag, no other --security-opt (seccomp, apparmor,
+// no-new-privileges, unmask, label=nested, ...), no "--flag value" pair
+// split over two entries, and no annotation or label in a namespace the
+// container runtime acts upon. The error never quotes the argument.
+func ValidateRunArg(arg string) error {
+	switch {
+	case runArgUsernsRe.MatchString(arg), runArgLabelOptRe.MatchString(arg):
+		return nil
+	}
+	if m := runArgMetaRe.FindStringSubmatch(arg); m != nil {
+		key := strings.ToLower(m[2])
+		for _, pre := range runtimeMetaPrefixes {
+			if strings.HasPrefix(key, pre) {
+				return fmt.Errorf("--%s keys under %q are read by the container runtime and are not allowed here", m[1], pre)
+			}
+		}
+		return nil
+	}
+	return errors.New("not allowed here: only --userns=keep-id[:opts], --security-opt=label=disable|type:|level:|user:|role:, " +
+		"--annotation=key=value and --label=key=value, each as one --flag=value argument")
+}
+
 // LoadDaemon loads and validates dutydesk.yaml. Relative paths are taken
 // from the file's directory. Defaults: runtime "podman", seat max_parallel
 // 1, max_parallel_runs = the sum of the seats', heartbeat every 1m,
 // config_remote.branch "main" and forge "gitlab", action_install_dir
-// /opt/dutydesk/bin, lock_clients = the defaults of internal/lockcli.
+// /opt/dutydesk/bin, lock_clients = the defaults of internal/lockcli,
+// quota_cap 5h, agent.max_transcript_bytes 20 MiB, retention.transcripts
+// 720h (30d) and retention.incidents 4320h (180d).
 func LoadDaemon(path string) (*Daemon, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -269,6 +348,26 @@ func LoadDaemon(path string) (*Daemon, error) {
 	if d.Heartbeat.Every < 10*time.Second || d.Heartbeat.Every > time.Hour {
 		el.addf(path, "heartbeat.every: want a duration in [10s, 1h]")
 	}
+	d.QuotaCap = time.Duration(df.QuotaCap)
+	if d.QuotaCap == 0 {
+		d.QuotaCap = DefaultQuotaCap
+	}
+	if d.QuotaCap < 10*time.Minute || d.QuotaCap > 24*time.Hour {
+		el.addf(path, "quota_cap: want a duration in [10m, 24h]")
+	}
+	d.Retention = Retention{Transcripts: time.Duration(df.Retention.Transcripts), Incidents: time.Duration(df.Retention.Incidents)}
+	if d.Retention.Transcripts == 0 {
+		d.Retention.Transcripts = DefaultRetentionTranscripts
+	}
+	if d.Retention.Incidents == 0 {
+		d.Retention.Incidents = DefaultRetentionIncidents
+	}
+	if d.Retention.Transcripts < time.Hour {
+		el.addf(path, "retention.transcripts: want a duration of at least 1h")
+	}
+	if d.Retention.Incidents < d.Retention.Transcripts {
+		el.addf(path, "retention.incidents: %s is shorter than retention.transcripts (%s)", d.Retention.Incidents, d.Retention.Transcripts)
+	}
 	d.Agent = AgentConfig{
 		Network: df.Agent.Network, HTTPSProxy: df.Agent.HTTPSProxy, NoProxy: df.Agent.NoProxy,
 		MCPConfig: df.Agent.MCPConfig, ExtraMounts: df.Agent.ExtraMounts, User: df.Agent.User,
@@ -302,16 +401,18 @@ func LoadDaemon(path string) (*Daemon, error) {
 		el.addf(path, "agent.user: want a non-root numeric uid[:gid]")
 	}
 	for i, arg := range a.RunArgs {
-		// The isolation of the container is not negotiable from this file.
-		name, _, _ := strings.Cut(arg, "=")
-		switch {
-		case !strings.HasPrefix(arg, "--"):
-			el.addf(path, "agent.run_args[%d]: want a --flag[=value]", i)
-		case name == "--privileged", name == "--network", name == "--net", name == "--cap-add", name == "--pid",
-			name == "--ipc", name == "--device", name == "--volume", name == "--mount", name == "--user",
-			name == "--security-opt", name == "--env", name == "--env-file", name == "--entrypoint", name == "--volumes-from":
-			el.addf(path, "agent.run_args[%d]: %s is not allowed here", i, name)
+		// The isolation of the container is not negotiable from this file:
+		// an allow-list, never a deny-list.
+		if err := ValidateRunArg(arg); err != nil {
+			el.addf(path, "agent.run_args[%d]: %v", i, err)
 		}
+	}
+	d.Agent.MaxTranscriptBytes = DefaultMaxTranscriptBytes
+	if v := df.Agent.MaxTranscriptBytes; v != nil {
+		d.Agent.MaxTranscriptBytes = *v
+	}
+	if n := d.Agent.MaxTranscriptBytes; n < 64<<10 || n > 1<<30 {
+		el.addf(path, "agent.max_transcript_bytes: %d is outside [65536, 1073741824] (64 KiB to 1 GiB)", n)
 	}
 	for key, v := range map[string]string{"memory": a.Memory, "cpus": a.CPUs} {
 		if v != "" && !resourceRe.MatchString(v) {

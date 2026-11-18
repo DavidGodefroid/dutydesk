@@ -3,6 +3,7 @@ package forge
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -95,6 +96,9 @@ type fakeAPI struct {
 	fail   int    // status returned by every call when non-zero
 	state  string // state returned by the GET endpoints
 	merged bool
+	// failPosts makes the next n requests that open a merge request fail.
+	failPosts int
+	opened    map[string]bool // source branches with an open merge request
 }
 
 func newFakeAPI(t *testing.T) *fakeAPI {
@@ -112,6 +116,34 @@ func (a *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	a.calls = append(a.calls, call)
 	fail, state, merged := a.fail, a.state, a.merged
+	gitlab := strings.HasPrefix(r.RequestURI, "/api/v4/")
+	path, _, _ := strings.Cut(r.RequestURI, "?")
+	opening := r.Method == http.MethodPost && (strings.HasSuffix(path, "/merge_requests") || strings.HasSuffix(path, "/pulls"))
+	if opening && fail == 0 {
+		if a.failPosts > 0 {
+			a.failPosts--
+			fail = http.StatusBadGateway
+		} else {
+			if a.opened == nil {
+				a.opened = map[string]bool{}
+			}
+			key := "source_branch"
+			if !gitlab {
+				key = "head"
+			}
+			a.opened[fmt.Sprint(call.Body[key])] = true
+		}
+	}
+	listed := false
+	if r.Method == http.MethodGet {
+		q := r.URL.Query()
+		if gitlab {
+			listed = a.opened[q.Get("source_branch")]
+		} else {
+			_, b, _ := strings.Cut(q.Get("head"), ":")
+			listed = a.opened[b]
+		}
+	}
 	a.mu.Unlock()
 	if fail != 0 {
 		// A careless server echoing the credential back.
@@ -119,8 +151,23 @@ func (a *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	gitlab := strings.HasPrefix(r.RequestURI, "/api/v4/")
 	switch {
+	case gitlab && r.Method == http.MethodGet && strings.HasSuffix(path, "/merge_requests"):
+		q := r.URL.Query()
+		list := []map[string]any{}
+		if listed && q.Get("state") == "opened" {
+			list = append(list, map[string]any{"iid": 7, "web_url": "https://gitlab.example.com/group/app/-/merge_requests/7",
+				"state": "opened", "source_branch": q.Get("source_branch")})
+		}
+		json.NewEncoder(w).Encode(list)
+	case !gitlab && r.Method == http.MethodGet && strings.HasSuffix(path, "/pulls"):
+		q := r.URL.Query()
+		list := []map[string]any{}
+		if owner, b, _ := strings.Cut(q.Get("head"), ":"); listed && owner == "owner" && q.Get("state") == "open" {
+			list = append(list, map[string]any{"number": 12, "html_url": "https://github.com/owner/app/pull/12",
+				"state": "open", "head": map[string]any{"ref": b}})
+		}
+		json.NewEncoder(w).Encode(list)
 	case gitlab && r.Method == http.MethodPost && strings.HasSuffix(r.RequestURI, "/merge_requests"):
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(map[string]any{"iid": 7, "web_url": "https://gitlab.example.com/group/app/-/merge_requests/7",

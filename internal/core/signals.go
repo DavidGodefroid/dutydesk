@@ -12,6 +12,7 @@ import (
 	"github.com/DavidGodefroid/dutydesk/internal/config"
 	"github.com/DavidGodefroid/dutydesk/internal/incident"
 	"github.com/DavidGodefroid/dutydesk/internal/model"
+	"github.com/DavidGodefroid/dutydesk/internal/store"
 )
 
 // Ingest turns one signal into incident state with the rules of its project:
@@ -22,6 +23,19 @@ func Ingest(mgr *incident.Manager, p *model.Project, sig model.Signal) (incident
 		return incident.IngestResult{}, errors.New("core: signal for an unknown project")
 	}
 	sig.Project = p.Slug
+	// Signal text comes from production data or from a webhook: no control
+	// character is stored, journaled or printed.
+	sig.Summary, sig.Fingerprint = model.CleanLine(sig.Summary), model.CleanLine(sig.Fingerprint)
+	if sig.Fingerprint == "" {
+		return incident.IngestResult{}, errors.New("core: signal without a fingerprint")
+	}
+	if len(sig.Fields) > 0 {
+		fields := make(map[string]string, len(sig.Fields))
+		for k, v := range sig.Fields {
+			fields[model.CleanLine(k)] = model.CleanText(v)
+		}
+		sig.Fields = fields
+	}
 	return mgr.Ingest(sig, p.Limits, familyOf(p, sig), config.RunbookFor(p, sig.Source).ID)
 }
 
@@ -64,12 +78,14 @@ func (s *Service) ingest(sig model.Signal) {
 		s.Kick()
 	case incident.IngestMassCreated:
 		s.log.Warn("storm guard tripped: mass incident opened", "incident", res.Incident.ID, "project", sig.Project, "source", sig.Source)
+	case incident.IngestRecurrent:
+		s.log.Warn("pass budget of the family used up: incident opened escalated, no agent pass", "incident", res.Incident.ID,
+			"project", sig.Project, "source", sig.Source, "family", res.Incident.Family)
 	}
-	if res.Alert == model.AlertStorm {
-		s.alertIncident(s.effectCtx(), p, res.Incident, model.AlertStorm,
-			"Storm on "+sig.Source+": new signals are grouped",
-			res.Incident.Summary+"\nDutyDesk stopped opening one incident per signal for this source and runs no agent on the grouped ones. "+
-				"Look for the common cause; close the mass incident when it is over (dutydesk incident close "+res.Incident.ID+").", "")
+	if res.Alert != "" {
+		// The alert is owed in the outbox, written with the incident (also
+		// when `dutydesk check run` ingested the signal).
+		s.kickOutbox(store.EffectTransition)
 	}
 }
 
@@ -83,7 +99,7 @@ func (s *Service) checkSink(c model.Check, signals []model.Signal, err error) {
 		if errors.As(err, &failing) {
 			s.log.Error("check keeps failing", "project", c.Project, "check", c.ID, "consecutive", failing.Consecutive,
 				"error", s.scrub(err.Error()))
-			s.alertOnce(s.effectCtx(), "check-failing:"+c.Project+"/"+c.ID, time.Hour, model.Alert{
+			s.alertOnce("check-failing:"+c.Project+"/"+c.ID, time.Hour, model.Alert{
 				Kind: model.AlertSystem, Project: c.Project,
 				Title: fmt.Sprintf("Check %s failed %d times in a row", c.ID, failing.Consecutive),
 				Body:  "This check no longer watches production. Last error:\n" + s.scrub(failing.Err.Error()),
@@ -99,18 +115,24 @@ func (s *Service) checkSink(c model.Check, signals []model.Signal, err error) {
 }
 
 // sourceResolved closes the open incident a webhook source declares over.
+// Only an incident of that very source: two sources can produce the same
+// fingerprint, and one must not close the incidents of the other.
 func (s *Service) sourceResolved(project, source, fingerprint string) {
-	inc, err := s.st.FindOpenIncident(project, fingerprint)
+	inc, err := s.st.FindOpenIncident(project, model.CleanLine(fingerprint))
 	if err != nil || inc == nil {
 		return
 	}
-	tr, err := s.mgr.Close(inc.ID, "resolved at the source ("+source+")")
-	if err != nil && !errors.Is(err, incident.ErrDossier) {
+	if inc.Source != source || inc.Mass {
+		s.log.Warn("resolved webhook ignored: the open incident with this fingerprint belongs to another source",
+			"incident", inc.ID, "incident_source", inc.Source, "webhook_source", source)
+		return
+	}
+	if _, err := s.mgr.Close(inc.ID, "resolved at the source ("+source+")"); err != nil && !errors.Is(err, incident.ErrDossier) {
 		s.log.Warn("incident not closed on a resolved webhook", "incident", inc.ID, "error", err)
 		return
 	}
 	s.cancelPass(inc.ID)
-	s.withdraw(s.effectCtx(), s.Project(project), tr.WithdrawTicket)
+	s.kickOutbox(store.EffectTransition) // a held ticket is withdrawn by the outbox
 	s.log.Info("incident closed by its source", "incident", inc.ID, "source", source)
 }
 
@@ -141,49 +163,50 @@ func (s *Service) locksServing(p *model.Project) bool {
 	return g != nil && g.serving
 }
 
-// pollLocks reads lox live's health per workspace. While a workspace does
-// not serve, nothing starts for its projects; a human is alerted once, with
+// pollLocks reads lox live's health per workspace, outside the main loop.
+// While a workspace does not serve, nothing starts for its projects; a
+// human is alerted once (through the outbox: retried until delivered), with
 // what needs enrolment or a secret.
 func (s *Service) pollLocks(ctx context.Context) {
 	for ws, projects := range s.workspaces() {
-		hctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		h, err := s.o.Status.Health(hctx, ws)
-		cancel()
-		if ctx.Err() != nil {
-			return
-		}
-		serving := err == nil && h.Serving
-		s.mu.Lock()
-		g := s.gate[ws]
-		if g == nil {
-			g = &gateState{}
-			s.gate[ws] = g
-		}
-		was, alerted := g.serving, g.alerted
-		g.serving = serving
-		if serving {
-			g.alerted = false
-		} else {
-			g.alerted = true
-		}
-		s.mu.Unlock()
+		s.background(ctx, s.ioSem, "health:"+ws, func(ctx context.Context) { s.pollWorkspace(ctx, ws, projects) })
+	}
+}
 
-		switch {
-		case serving && !was:
-			s.log.Info("locks serve", "workspace", ws)
-			s.Kick()
-		case !serving && !alerted:
-			detail := "the status socket of lox live does not answer"
-			if err == nil {
-				detail = lockDetail(h)
-			}
-			s.log.Warn("locks do not serve: no agent starts, scheduled checks are skipped", "workspace", ws, "detail", detail)
-			for _, p := range projects {
-				s.sendAlert(ctx, p, model.Alert{Kind: model.AlertLocksDown, Project: p.Slug,
-					Title: "The locks do not serve: DutyDesk is blind and starts no agent",
-					Body: detail + "\nChecks are skipped and incidents wait in the queue until the locks serve again. " +
-						"On the lock host: check `lox live status`; a lock that needs enrolment or a secret needs a human at a terminal."})
-			}
+func (s *Service) pollWorkspace(ctx context.Context, ws string, projects []*model.Project) {
+	hctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	h, err := s.o.Status.Health(hctx, ws)
+	cancel()
+	if ctx.Err() != nil {
+		return
+	}
+	serving := err == nil && h.Serving
+	s.mu.Lock()
+	g := s.gate[ws]
+	if g == nil {
+		g = &gateState{}
+		s.gate[ws] = g
+	}
+	was, alerted := g.serving, g.alerted
+	g.serving = serving
+	g.alerted = !serving
+	s.mu.Unlock()
+
+	switch {
+	case serving && !was:
+		s.log.Info("locks serve", "workspace", ws)
+		s.Kick()
+	case !serving && !alerted:
+		detail := "the status socket of lox live does not answer"
+		if err == nil {
+			detail = lockDetail(h)
+		}
+		s.log.Warn("locks do not serve: no agent starts, scheduled checks are skipped", "workspace", ws, "detail", detail)
+		for _, p := range projects {
+			s.sendAlert(p, model.Alert{Kind: model.AlertLocksDown, Project: p.Slug,
+				Title: "The locks do not serve: DutyDesk is blind and starts no agent",
+				Body: detail + "\nChecks are skipped and incidents wait in the queue until the locks serve again. " +
+					"On the lock host: check `lox live status`; a lock that needs enrolment or a secret needs a human at a terminal."})
 		}
 	}
 }
@@ -226,48 +249,34 @@ func (g gatedReader) LogCount(ctx context.Context, p *model.Project, query strin
 
 // ---------- alerts ----------
 
-// effectCtx is the context of side effects that must not be cut by a
-// shutdown in the middle (an alert, a push); callers bound it.
-func (s *Service) effectCtx() context.Context {
-	s.mu.Lock()
-	ctx := s.runCtx
-	s.mu.Unlock()
-	if ctx == nil {
-		return context.Background()
+// sendAlert owes one alert: it is scrubbed, stripped of control characters
+// and stored in the outbox, from where it is delivered and retried until it
+// went out. Nothing is recorded as sent before it is.
+func (s *Service) sendAlert(p *model.Project, a model.Alert) {
+	a = s.cleanAlert(p, a)
+	if _, err := s.st.EnqueueAlert(a); err != nil {
+		s.log.Error("alert not stored", "kind", string(a.Kind), "project", a.Project, "incident", a.Incident, "error", err)
+		return
 	}
-	return context.WithoutCancel(ctx)
+	s.kickOutbox(store.EffectAlert)
 }
 
-// sendAlert scrubs, sends and records one alert. A send failure is logged:
-// the alert is recorded all the same, so the report shows it.
-func (s *Service) sendAlert(ctx context.Context, p *model.Project, a model.Alert) {
-	a.Title, a.Body = s.scrub(a.Title), s.scrub(a.Body)
+func (s *Service) cleanAlert(p *model.Project, a model.Alert) model.Alert {
+	a.Title, a.Body = model.CleanLine(s.scrub(a.Title)), model.CleanText(s.scrub(a.Body))
 	if a.At.IsZero() {
 		a.At = s.now()
 	}
 	if p != nil && a.Project == "" {
 		a.Project = p.Slug
 	}
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-	if err := s.o.Notifier.Send(ctx, p, a); err != nil {
-		s.log.Error("alert not delivered", "kind", string(a.Kind), "project", a.Project, "incident", a.Incident, "error", err)
-	}
-	if _, err := s.st.RecordAlert(a); err != nil {
-		s.log.Error("alert not recorded", "kind", string(a.Kind), "error", err)
-	}
-	s.log.Info("alert", "kind", string(a.Kind), "project", a.Project, "incident", a.Incident, "title", a.Title)
+	return a
 }
 
-func (s *Service) alertIncident(ctx context.Context, p *model.Project, inc model.Incident, kind model.AlertKind, title, body, url string) {
-	s.sendAlert(ctx, p, model.Alert{Kind: kind, Project: inc.Project, Incident: inc.ID, Title: title, Body: body, URL: url})
-}
-
-// systemAlert sends an alert that concerns DutyDesk itself: to the project
+// systemAlert owes an alert that concerns DutyDesk itself: to the project
 // it names, else to every project (one per distinct alert channel).
-func (s *Service) systemAlert(ctx context.Context, a model.Alert) {
+func (s *Service) systemAlert(a model.Alert) {
 	if p := s.Project(a.Project); p != nil {
-		s.sendAlert(ctx, p, a)
+		s.sendAlert(p, a)
 		return
 	}
 	seen := map[string]bool{}
@@ -277,12 +286,12 @@ func (s *Service) systemAlert(ctx context.Context, a model.Alert) {
 		}
 		seen[p.Alerts.WebhookURLFile] = true
 		one := a
-		s.sendAlert(ctx, p, one)
+		s.sendAlert(p, one)
 	}
 }
 
-// alertOnce sends a system alert at most once per period for a key.
-func (s *Service) alertOnce(ctx context.Context, key string, every time.Duration, a model.Alert) {
+// alertOnce owes a system alert at most once per period for a key.
+func (s *Service) alertOnce(key string, every time.Duration, a model.Alert) {
 	now := s.now()
 	s.mu.Lock()
 	last, ok := s.onceAlerts[key]
@@ -292,7 +301,19 @@ func (s *Service) alertOnce(ctx context.Context, key string, every time.Duration
 	}
 	s.onceAlerts[key] = now
 	s.mu.Unlock()
-	s.systemAlert(ctx, a)
+	s.systemAlert(a)
+}
+
+// subject is how an alert title names an incident. The summary of a webhook
+// incident is built from what a third party sent: its alert titles only
+// carry the source and the fingerprint (source + issue id for Sentry).
+func subject(p *model.Project, inc model.Incident) string {
+	if p != nil {
+		if _, ok := p.Webhooks[inc.Source]; ok && !inc.Mass {
+			return short(model.CleanLine(inc.Source+" "+inc.Fingerprint), 100)
+		}
+	}
+	return short(model.CleanLine(inc.Summary), 160)
 }
 
 // withdraw withdraws a pending ticket at the hub, best effort.

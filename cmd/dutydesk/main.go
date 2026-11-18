@@ -62,7 +62,34 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
+// termSafe drops control characters (ESC, CR, the C1 range, everything
+// below 0x20 but newline and tab) from what the CLI prints: summaries,
+// journals and errors hold text that came from agents and signals, and a
+// terminal must never interpret it.
+type termSafe struct{ w io.Writer }
+
+func (t termSafe) Write(p []byte) (int, error) {
+	out := make([]byte, 0, len(p))
+	for i := 0; i < len(p); i++ {
+		b := p[i]
+		switch {
+		case b == '\n' || b == '\t':
+			out = append(out, b)
+		case b < 0x20 || b == 0x7f:
+		case b == 0xc2 && i+1 < len(p) && p[i+1] >= 0x80 && p[i+1] <= 0x9f:
+			i++ // C1 control character, UTF-8 encoded
+		default:
+			out = append(out, b)
+		}
+	}
+	if _, err := t.w.Write(out); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
 func run(args []string, stdout, stderr io.Writer) int {
+	stdout, stderr = termSafe{stdout}, termSafe{stderr}
 	err := dispatch(args, stdout, stderr)
 	var ue usageError
 	switch {
@@ -645,6 +672,11 @@ func (c *cli) incidentClose(id string) error {
 		return lifecycleError(id, err)
 	}
 	fmt.Fprintf(c.stdout, "%s: %s → resolved (%s)\n", id, tr.From, tr.Reason)
+	if tr.From == model.StateInvestigating {
+		// The daemon sees the new state at its next loop turn, cancels the
+		// pass and kills its container.
+		fmt.Fprintln(c.stdout, "an agent pass was running: the daemon stops it and removes its container")
+	}
 	c.withdraw(d, repo, tr.Incident, tr.WithdrawTicket)
 	return nil
 }
@@ -747,6 +779,11 @@ func (c *cli) checkRun(id string) error {
 			return err
 		}
 		fmt.Fprintf(c.stdout, "  %s → %s (%s)\n", s.Fingerprint, r.Incident.ID, r.Kind)
+		if r.Alert != "" {
+			// The alert was stored in the outbox with the incident: the
+			// daemon delivers it (and retries until it went out).
+			fmt.Fprintf(c.stdout, "  %s: a %s alert is owed; the running daemon delivers it\n", r.Incident.ID, r.Alert)
+		}
 	}
 	return nil
 }

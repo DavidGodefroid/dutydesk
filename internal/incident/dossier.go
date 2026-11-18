@@ -173,7 +173,9 @@ func writeFile(path string, data []byte) error {
 //
 //	<body>
 //
-// The journal is append-only; entries are never rewritten.
+// The journal is append-only; entries are never rewritten. Control
+// characters are stripped from the title and the body; text that comes from
+// an agent or a signal must be passed through Quote by the caller.
 func (d *Dossier) Append(id string, at time.Time, title, body string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -182,9 +184,18 @@ func (d *Dossier) Append(id string, at time.Time, title, body string) error {
 		return err
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "## %s — %s\n\n", stamp(at), oneLine(title))
-	if body = strings.TrimSpace(body); body != "" {
-		b.WriteString(body)
+	fmt.Fprintf(&b, "## %s — %s\n\n", stamp(at), inline(title))
+	if body = strings.TrimSpace(model.CleanText(body)); body != "" {
+		// Only Append writes headings: a body line that looks like one
+		// (whatever text it came from) is quoted, so that it can never
+		// pass for an entry of its own.
+		lines := strings.Split(body, "\n")
+		for i, l := range lines {
+			if strings.HasPrefix(l, "#") {
+				lines[i] = "> " + l
+			}
+		}
+		b.WriteString(strings.Join(lines, "\n"))
 		b.WriteString("\n\n")
 	}
 	f, err := os.OpenFile(filepath.Join(dir, "journal.md"), os.O_WRONLY|os.O_CREATE|os.O_APPEND, fileMode)
@@ -244,8 +255,4 @@ func stamp(t time.Time) string {
 		return ""
 	}
 	return t.UTC().Format(time.RFC3339)
-}
-
-func oneLine(s string) string {
-	return strings.Join(strings.Fields(s), " ")
 }

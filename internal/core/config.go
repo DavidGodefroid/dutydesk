@@ -57,7 +57,7 @@ func (s *Service) syncConfig(ctx context.Context) {
 	if err != nil {
 		if ctx.Err() == nil {
 			s.log.Warn("config repository not fetched", "error", s.scrub(err.Error()))
-			s.alertOnce(ctx, "config-fetch", 6*time.Hour, model.Alert{Kind: model.AlertSystem,
+			s.alertOnce("config-fetch", 6*time.Hour, model.Alert{Kind: model.AlertSystem,
 				Title: "The configuration repository cannot be fetched",
 				Body:  "DutyDesk keeps running with its current configuration.\n" + s.scrub(err.Error())})
 		}
@@ -74,7 +74,7 @@ func (s *Service) syncConfig(ctx context.Context) {
 		s.badConfig = rev
 		s.mu.Unlock()
 		s.log.Error("new configuration rejected; keeping the current one", "revision", rev, "error", why)
-		s.systemAlert(ctx, model.Alert{Kind: model.AlertSystem,
+		s.systemAlert(model.Alert{Kind: model.AlertSystem,
 			Title: "New configuration rejected (revision " + short(rev, 12) + ")",
 			Body:  "DutyDesk keeps running with the previous configuration. Fix the config repository:\n" + s.scrub(why.Error())})
 	}
@@ -125,23 +125,46 @@ func (s *Service) configRepo(project string) (model.Repo, bool) {
 		DefaultBranch: r.Branch, TokenFile: r.TokenFile}, true
 }
 
-// configPolicy is the path policy of proposals: on the configuration
-// repository an agent may only propose checks, runbooks and actions of its
-// own project. project.yaml (seats, repos, locks, limits), standard/ and
-// every other project are out of reach. Project repositories have no
-// restriction beyond the forge's own checks.
-func configPolicy(repo model.Repo) forge.PathPolicy {
+// DefaultDenyPaths are the paths a DutyDesk merge request on a project
+// repository may not touch unless project.yaml says otherwise
+// (repos[].deny_paths): CI definitions run on the pushed branch BEFORE any
+// human reviews the merge request, with whatever secrets the runners hold,
+// and git plumbing files change what a checkout does.
+var DefaultDenyPaths = []string{
+	".gitlab-ci.yml", ".gitlab/**", ".github/**", ".circleci/**", ".woodpecker/**", ".woodpecker.yml", ".drone.yml",
+	".buildkite/**", ".travis.yml", "Jenkinsfile", "azure-pipelines.yml", "bitbucket-pipelines.yml",
+	".gitmodules", ".gitattributes", "**/.gitmodules", "**/.gitattributes", "**/.git/**",
+}
+
+// proposalPolicy is the path policy of proposals.
+//
+// On the configuration repository an agent may only propose checks,
+// runbooks and actions of its own project: project.yaml (seats, repos,
+// locks, limits), standard/ and every other project are out of reach. A
+// path must lie at least one segment below checks/, runbooks/ or actions/
+// (the directories themselves cannot be replaced by a file or a link), and
+// no symbolic link is accepted at all.
+//
+// On a project repository the built-in deny-list DefaultDenyPaths applies,
+// replaced by the repository's deny_paths when project.yaml sets it and
+// narrowed by its allow_paths.
+func proposalPolicy(repo model.Repo) forge.PathPolicy {
 	project, ok := strings.CutPrefix(repo.Name, configRepoPrefix)
 	if !ok {
-		return forge.PathPolicy{}
+		deny := DefaultDenyPaths
+		if repo.DenyPaths != nil {
+			deny = repo.DenyPaths
+		}
+		return forge.PathPolicy{Allow: repo.AllowPaths, Deny: deny}
 	}
 	if project == "" || strings.ContainsAny(project, "*?[/\\") {
-		return forge.PathPolicy{Deny: []string{"**"}}
+		return forge.PathPolicy{Deny: []string{"**"}, NoSymlinks: true}
 	}
 	base := "projects/" + project + "/"
 	return forge.PathPolicy{
-		Allow: []string{base + "checks/**", base + "runbooks/**", base + "actions/**"},
-		Deny:  []string{base + "project.yaml", "standard/**"},
+		Allow:      []string{base + "checks/*", base + "runbooks/*", base + "actions/*"},
+		Deny:       []string{base + "project.yaml", "standard/**"},
+		NoSymlinks: true,
 	}
 }
 
@@ -197,6 +220,13 @@ func (s *Service) Secrets() []string {
 		if open, err := s.st.ListIncidents(storeOpenFilter); err == nil {
 			for _, inc := range open {
 				add(inc.AgentToken)
+			}
+		}
+		// The effects of a pass run after it: the token of an incident the
+		// pass resolved still counts while its proposal is owed.
+		if owed, err := s.st.OwedAgentTokens(); err == nil {
+			for _, tok := range owed {
+				add(tok)
 			}
 		}
 	}

@@ -10,10 +10,22 @@ import (
 	"github.com/DavidGodefroid/dutydesk/internal/model"
 )
 
-// checkValue is the rule every parameter value obeys, whatever its type.
-// It is what makes one lockssh glob token per value sound: a glob never
-// crosses "/", never matches an option (leading "-" or "+") nor a "." or
-// ".." segment. The error never quotes the value.
+// SafeValueClass is the only set of characters a parameter value may hold,
+// whatever its type: no shell metacharacter, no quote, no whitespace, no
+// "/" and nothing outside ASCII. Enum members and string patterns are held
+// to it when a manifest is validated, every value again at run time.
+const SafeValueClass = "[A-Za-z0-9._:@=+-]"
+
+func safeByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+		c == '.' || c == '_' || c == ':' || c == '@' || c == '=' || c == '+' || c == '-'
+}
+
+// checkValue is the rule every parameter value obeys, whatever its type:
+// 1 to MaxValueLen characters of SafeValueClass, not starting with "-" or
+// "+" (an option), and neither "." nor "..". Even if a layer between the
+// agent and the script handed the value to a shell, it could not be read
+// as shell syntax. The error never quotes the value.
 func checkValue(v string) error {
 	switch {
 	case v == "":
@@ -26,8 +38,8 @@ func checkValue(v string) error {
 		return errors.New("is \".\" or \"..\"")
 	}
 	for i := 0; i < len(v); i++ {
-		if c := v[i]; c < 0x21 || c > 0x7E || c == '/' {
-			return errors.New("holds \"/\", whitespace or a character outside printable ASCII")
+		if !safeByte(v[i]) {
+			return errors.New("holds a character outside " + SafeValueClass)
 		}
 	}
 	return nil
@@ -38,9 +50,9 @@ var intRe = regexp.MustCompile(`^(0|[1-9][0-9]{0,17})$`)
 // ValidateArgs checks args against the manifest of a: every declared
 // parameter is present, nothing else is, and each value has its type
 // (int: plain non-negative decimal within min/max; enum: one of the
-// values; string: full match of the pattern). A value never holds "/",
-// whitespace or a non-printable character and never starts with "-" or
-// "+". Errors name the parameter and never quote the value.
+// values; string: full match of the pattern). A value only holds
+// characters of SafeValueClass and never starts with "-" or "+", whatever
+// the manifest says. Errors name the parameter and never quote the value.
 func ValidateArgs(a model.Action, args map[string]string) error {
 	declared := map[string]bool{}
 	for _, p := range a.Params {

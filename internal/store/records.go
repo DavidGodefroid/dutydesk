@@ -87,13 +87,39 @@ func (s *Store) AttachSignal(signalID int64, incidentID string) error {
 	})
 }
 
-// RecordSignal inserts a signal and attaches it to the incident in one
-// transaction.
+// MaxSignalRows is how many signals of one incident are kept as rows: the
+// origin signal and the first that followed. A later signal of the same
+// fingerprint only moves the incident's counter and last-seen time, so a
+// condition that fires for weeks does not grow the database.
+const MaxSignalRows = 20
+
+// RecordSignal attaches a signal to the incident in one transaction: the
+// signal count, the last-seen time and the severity of the incident always
+// move; the signal itself is stored as a row only for the first
+// MaxSignalRows signals (the returned id is 0 afterwards).
 func (s *Store) RecordSignal(sig model.Signal, incidentID string) (int64, error) {
 	var id int64
 	err := s.tx(func(tx *sql.Tx) error {
+		var rows int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM (SELECT 1 FROM signals WHERE incident_id = ? LIMIT ?)`,
+			incidentID, MaxSignalRows).Scan(&rows); err != nil {
+			return err
+		}
+		at := s.signalTime(sig)
+		if rows >= MaxSignalRows {
+			res, err := tx.Exec(`UPDATE incidents SET signal_count = signal_count + 1,
+				last_signal_at = MAX(last_signal_at, ?), severity = MAX(severity, ?), updated_at = ?
+				WHERE id = ?`, fmtTime(at), int(sig.Severity), fmtTime(s.now()), incidentID)
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return ErrNotFound
+			}
+			return nil
+		}
 		var err error
-		if id, err = insertSignal(tx, sig, s.signalTime(sig)); err != nil {
+		if id, err = insertSignal(tx, sig, at); err != nil {
 			return err
 		}
 		return attachSignal(tx, id, incidentID, s.now())
@@ -136,6 +162,30 @@ func (s *Store) ListSignals(incidentID string) ([]SignalRecord, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// OriginSignal returns the signal that opened the incident, or nil.
+func (s *Store) OriginSignal(incidentID string) (*SignalRecord, error) {
+	var (
+		r          SignalRecord
+		inc        sql.NullString
+		sev        int
+		fields, at string
+	)
+	err := s.db.QueryRow(`SELECT id, incident_id, project, source, fingerprint, severity, summary, fields, at
+		FROM signals WHERE incident_id = ? ORDER BY id ASC LIMIT 1`, incidentID).
+		Scan(&r.ID, &inc, &r.Project, &r.Source, &r.Fingerprint, &sev, &r.Summary, &fields, &at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.IncidentID, r.Severity, r.At = inc.String, model.Severity(sev), parseTime(at)
+	if err := json.Unmarshal([]byte(fields), &r.Fields); err != nil {
+		return nil, fmt.Errorf("store: signal %d fields: %w", r.ID, err)
+	}
+	return &r, nil
 }
 
 // ---------- runs ----------
@@ -310,12 +360,21 @@ func scanKnownProblem(sc scanner) (model.KnownProblem, error) {
 // OpenKnownProblem records an open merge request for an incident family.
 // ID and OpenedAt (when zero) are set by the store.
 func (s *Store) OpenKnownProblem(k model.KnownProblem) (model.KnownProblem, error) {
+	err := s.tx(func(tx *sql.Tx) error {
+		var err error
+		k, err = s.openKnownProblem(tx, k)
+		return err
+	})
+	return k, err
+}
+
+func (s *Store) openKnownProblem(tx *sql.Tx, k model.KnownProblem) (model.KnownProblem, error) {
 	if k.OpenedAt.IsZero() {
 		k.OpenedAt = s.now()
 	}
 	k.OpenedAt = normTime(k.OpenedAt)
 	k.ClosedAt = time.Time{}
-	res, err := s.db.Exec(`INSERT INTO known_problems (project, family, repo, mr_url, mr_id, incident, opened_at)
+	res, err := tx.Exec(`INSERT INTO known_problems (project, family, repo, mr_url, mr_id, incident, opened_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`, k.Project, k.Family, k.Repo, k.MRURL, k.MRID, k.Incident, fmtTime(k.OpenedAt))
 	if err != nil {
 		return k, fmt.Errorf("store: open known problem: %w", err)
@@ -374,33 +433,42 @@ func (s *Store) CloseKnownProblem(id int64) error {
 
 // ---------- alerts ----------
 
-// RecordAlert stores a sent alert or notice (a zero At becomes now). When
-// it concerns an incident and is a real alert (not a notice), the incident's
-// LastAlertAt moves to the alert's time, which restarts the reminder delay.
+// RecordAlert stores a DELIVERED alert or notice (a zero At becomes now).
+// When it concerns an incident and is a real alert (not a notice), the
+// incident's LastAlertAt moves to the alert's time, which restarts the
+// reminder delay. An alert that could not be delivered is never recorded
+// here: it stays in the outbox.
 func (s *Store) RecordAlert(a model.Alert) (int64, error) {
 	if a.At.IsZero() {
 		a.At = s.now()
 	}
 	var id int64
 	err := s.tx(func(tx *sql.Tx) error {
-		res, err := tx.Exec(`INSERT INTO alerts (kind, project, incident, title, body, url, at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			string(a.Kind), a.Project, a.Incident, a.Title, a.Body, a.URL, fmtTime(a.At))
-		if err != nil {
-			return err
-		}
-		if id, err = res.LastInsertId(); err != nil {
-			return err
-		}
-		if a.Incident == "" || a.Kind == model.NoticeMROpened || a.Kind == model.NoticeConfigMR {
-			return nil
-		}
-		_, err = tx.Exec(`UPDATE incidents SET last_alert_at = MAX(last_alert_at, ?) WHERE id = ?`, fmtTime(a.At), a.Incident)
+		var err error
+		id, err = recordAlert(tx, a)
 		return err
 	})
 	if err != nil {
 		return 0, fmt.Errorf("store: record alert: %w", err)
 	}
 	return id, nil
+}
+
+func recordAlert(tx *sql.Tx, a model.Alert) (int64, error) {
+	res, err := tx.Exec(`INSERT INTO alerts (kind, project, incident, title, body, url, at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		string(a.Kind), a.Project, a.Incident, a.Title, a.Body, a.URL, fmtTime(a.At))
+	if err != nil {
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if a.Incident == "" || a.Kind == model.NoticeMROpened || a.Kind == model.NoticeConfigMR {
+		return id, nil
+	}
+	_, err = tx.Exec(`UPDATE incidents SET last_alert_at = MAX(last_alert_at, ?) WHERE id = ?`, fmtTime(a.At), a.Incident)
+	return id, err
 }
 
 func (s *Store) lastAlert(where string, args ...any) (*model.Alert, error) {
@@ -446,6 +514,7 @@ type Proposal struct {
 	Project   string
 	Incident  string
 	Kind      string // ProposalImprovement | ProposalMissingAction
+	Family    string // incident family the proposal came from
 	Title     string
 	MRURL     string
 	MRID      string
@@ -456,6 +525,15 @@ type Proposal struct {
 // RecordProposal stores a proposal; ID, CreatedAt (when zero) and State
 // (default "open") are set by the store.
 func (s *Store) RecordProposal(p Proposal) (Proposal, error) {
+	err := s.tx(func(tx *sql.Tx) error {
+		var err error
+		p, err = s.recordProposal(tx, p)
+		return err
+	})
+	return p, err
+}
+
+func (s *Store) recordProposal(tx *sql.Tx, p Proposal) (Proposal, error) {
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = s.now()
 	}
@@ -463,13 +541,35 @@ func (s *Store) RecordProposal(p Proposal) (Proposal, error) {
 	if p.State == "" {
 		p.State = "open"
 	}
-	res, err := s.db.Exec(`INSERT INTO proposals (project, incident, kind, title, mr_url, mr_id, state, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, p.Project, p.Incident, p.Kind, p.Title, p.MRURL, p.MRID, p.State, fmtTime(p.CreatedAt))
+	res, err := tx.Exec(`INSERT INTO proposals (project, incident, kind, family, title, mr_url, mr_id, state, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, p.Project, p.Incident, p.Kind, p.Family, p.Title, p.MRURL, p.MRID, p.State, fmtTime(p.CreatedAt))
 	if err != nil {
 		return p, fmt.Errorf("store: record proposal: %w", err)
 	}
 	p.ID, err = res.LastInsertId()
 	return p, err
+}
+
+// FindOpenImprovement returns the oldest open improvement proposal of a
+// project and incident family, or nil: improvement-only merge requests are
+// not repeated while one waits for review.
+func (s *Store) FindOpenImprovement(project, family string) (*Proposal, error) {
+	var (
+		p  Proposal
+		at string
+	)
+	err := s.db.QueryRow(`SELECT id, project, incident, kind, family, title, mr_url, mr_id, state, created_at FROM proposals
+		WHERE project = ? AND family = ? AND kind = ? AND state = 'open' ORDER BY id ASC LIMIT 1`,
+		project, family, ProposalImprovement).
+		Scan(&p.ID, &p.Project, &p.Incident, &p.Kind, &p.Family, &p.Title, &p.MRURL, &p.MRID, &p.State, &at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	p.CreatedAt = parseTime(at)
+	return &p, nil
 }
 
 // SetProposalState updates the state of a proposal.
@@ -487,7 +587,7 @@ func (s *Store) SetProposalState(id int64, state string) error {
 // ListProposals returns the proposals of a project ("" = all), oldest
 // first; openOnly keeps those still in state "open".
 func (s *Store) ListProposals(project string, openOnly bool) ([]Proposal, error) {
-	rows, err := s.db.Query(`SELECT id, project, incident, kind, title, mr_url, mr_id, state, created_at FROM proposals
+	rows, err := s.db.Query(`SELECT id, project, incident, kind, family, title, mr_url, mr_id, state, created_at FROM proposals
 		WHERE (? = '' OR project = ?) AND (? = 0 OR state = 'open') ORDER BY id ASC`, project, project, boolInt(openOnly))
 	if err != nil {
 		return nil, err
@@ -499,7 +599,7 @@ func (s *Store) ListProposals(project string, openOnly bool) ([]Proposal, error)
 			p  Proposal
 			at string
 		)
-		if err := rows.Scan(&p.ID, &p.Project, &p.Incident, &p.Kind, &p.Title, &p.MRURL, &p.MRID, &p.State, &at); err != nil {
+		if err := rows.Scan(&p.ID, &p.Project, &p.Incident, &p.Kind, &p.Family, &p.Title, &p.MRURL, &p.MRID, &p.State, &at); err != nil {
 			return nil, err
 		}
 		p.CreatedAt = parseTime(at)

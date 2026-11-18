@@ -43,6 +43,13 @@ type Repo struct {
 	Project       string // forge project path, e.g. "group/app"
 	DefaultBranch string
 	TokenFile     string // file holding the service account token (read by the core only)
+	// DenyPaths replaces the built-in deny-list of paths a DutyDesk merge
+	// request may not touch (CI definitions, git plumbing files) when it is
+	// non-nil; an empty non-nil list lifts the restriction. nil = built-in.
+	DenyPaths []string
+	// AllowPaths, when non-empty, is the only set of paths a merge request
+	// may touch (globs, same syntax as DenyPaths).
+	AllowPaths []string
 }
 
 // Locks names the lock instances (as declared in lockfamily.yaml).
@@ -67,6 +74,8 @@ type Limits struct {
 	RecurrenceCount    int           // resolved incidents of one family within RecurrenceWindow
 	RecurrenceWindow   time.Duration
 	ReminderEvery      time.Duration // re-alert while an incident needs a human
+	MaxGreenLights     int           // green-light rounds per incident, then escalate (0 = 3)
+	MaxQuotaRuns       int           // passes lost to an exhausted seat per incident, then escalate (0 = 3)
 }
 
 type AlertConfig struct {
@@ -214,12 +223,23 @@ type Incident struct {
 	Runs        int
 	AgentToken  string // per-incident secret: lock agent identity token (never shown to humans)
 	Ticket      string // pending green-light ticket "instance/id"
+	GreenLights int    // green-light rounds asked so far
+	QuotaRuns   int    // passes that ended on an exhausted seat (not counted in Runs)
 	RecheckAt   time.Time
 	OpenedAt    time.Time
 	UpdatedAt   time.Time
 	ClosedAt    time.Time
-	LastAlertAt time.Time
+	LastAlertAt time.Time // last alert DELIVERED for this incident
 	CloseReason string
+	AgeFrom     time.Time // start of the age limit when a human resumed the incident; zero = OpenedAt
+}
+
+// AgeStart is the time the maximum incident age is counted from.
+func (i Incident) AgeStart() time.Time {
+	if i.AgeFrom.After(i.OpenedAt) {
+		return i.AgeFrom
+	}
+	return i.OpenedAt
 }
 
 // Outcome is the agent's conclusion for one pass.
@@ -401,6 +421,9 @@ type RunResult struct {
 	InputTok   int64
 	OutputTok  int64
 	QuotaReset time.Time // RunQuota: when the seat is usable again, zero = unknown
+	// Leftover names the agent container the launcher could not remove
+	// after the pass ("" = gone). The seat stays held until it is removed.
+	Leftover string
 }
 
 // AgentLauncher runs one agent pass in an isolated container and returns its verdict.
@@ -429,4 +452,73 @@ type Forge interface {
 // Notifier sends alerts and notices to humans.
 type Notifier interface {
 	Send(ctx context.Context, p *Project, a Alert) error
+}
+
+// ---------- untrusted text ----------
+
+// CleanText makes a text that came from an agent, a signal or any other
+// untrusted source safe to store and print: every control character except
+// newline and tab is dropped (ESC and the C1 range included, so no terminal
+// escape sequence survives), as are the Unicode line / paragraph separators
+// and bidirectional overrides; "\r\n" and a lone "\r" become "\n".
+func CleanText(s string) string {
+	clean := true
+	for _, r := range s {
+		if r == '\n' || r == '\t' {
+			continue
+		}
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) || r == 0x2028 || r == 0x2029 ||
+			(r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069) || r == 0xfffd {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	out := make([]rune, 0, len(s))
+	prevCR := false
+	for _, r := range s {
+		switch {
+		case r == '\r':
+			out = append(out, '\n')
+			prevCR = true
+			continue
+		case r == '\n':
+			if !prevCR {
+				out = append(out, r)
+			}
+		case r == '\t':
+			out = append(out, r)
+		case r < 0x20, r >= 0x7f && r <= 0x9f, r == 0x2028, r == 0x2029,
+			r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069, r == 0xfffd:
+		default:
+			out = append(out, r)
+		}
+		prevCR = false
+	}
+	return string(out)
+}
+
+// CleanLine is CleanText on one line: newlines and tabs become spaces and
+// runs of spaces collapse.
+func CleanLine(s string) string {
+	fields := []rune(CleanText(s))
+	out := make([]rune, 0, len(fields))
+	space := true
+	for _, r := range fields {
+		if r == '\n' || r == '\t' || r == ' ' {
+			if !space {
+				out = append(out, ' ')
+			}
+			space = true
+			continue
+		}
+		out = append(out, r)
+		space = false
+	}
+	for len(out) > 0 && out[len(out)-1] == ' ' {
+		out = out[:len(out)-1]
+	}
+	return string(out)
 }
