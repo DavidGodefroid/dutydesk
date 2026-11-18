@@ -245,6 +245,7 @@ func TestExistingSymlinkTurnedIntoAnEscape(t *testing.T) {
 	run(t, w, "push", "-q", "origin", "main")
 
 	e := &env{t: t, bare: bare, api: newFakeAPI(t)}
+	e.api.bare = e.bare
 	e.forge = New(Config{AllowLocal: true, TempDir: t.TempDir(), APIBase: map[string]string{"gitlab": e.api.URL + "/api/v4"}})
 	e.repo = model.Repo{Forge: "gitlab", URL: "file://" + bare, Project: "group/app", DefaultBranch: "main", TokenFile: tokenFile(t, testToken)}
 	e.dir = filepath.Join(t.TempDir(), "clone")
@@ -392,5 +393,38 @@ func TestSameBranchDifferentContent(t *testing.T) {
 	_, err = e.forge.Propose(context.Background(), e.repo, dir, "dutydesk/inc-1", "Fix", "d", false, nil)
 	if !errors.Is(err, ErrBranchExists) {
 		t.Fatalf("same tree, other base: %v, want ErrBranchExists", err)
+	}
+}
+
+// A merge request on our branch name that is not ours (opened from a fork, or
+// pointing at another commit) is never taken for the one DutyDesk opened.
+func TestForeignMergeRequestIsNotAdopted(t *testing.T) {
+	for _, kind := range []string{"gitlab", "github"} {
+		for _, how := range []string{"fork", "other commit"} {
+			t.Run(kind+"/"+how, func(t *testing.T) {
+				e := newEnv(t, kind, nil)
+				write(t, filepath.Join(e.dir, "src", "app.txt"), "changed\n")
+				if _, err := e.propose("dutydesk/inc-1", "Fix", "d"); err != nil {
+					t.Fatalf("Propose: %v", err)
+				}
+				e.api.mu.Lock()
+				e.api.foreign, e.api.staleHead = how == "fork", how == "other commit"
+				e.api.mu.Unlock()
+				before := len(e.api.recorded())
+				if _, err := e.propose("dutydesk/inc-1", "Fix", "d"); err != nil {
+					t.Fatalf("second Propose: %v", err)
+				}
+				opened := 0
+				for _, c := range e.api.recorded()[before:] {
+					p, _, _ := strings.Cut(c.URI, "?")
+					if c.Method == http.MethodPost && (strings.HasSuffix(p, "/merge_requests") || strings.HasSuffix(p, "/pulls")) {
+						opened++
+					}
+				}
+				if opened != 1 {
+					t.Fatalf("the foreign request was adopted: %d request(s) opened by the second call, want 1", opened)
+				}
+			})
+		}
 	}
 }

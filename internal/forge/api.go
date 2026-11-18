@@ -119,6 +119,10 @@ type glMR struct {
 	WebURL       string `json:"web_url"`
 	State        string `json:"state"`
 	SourceBranch string `json:"source_branch"`
+	// Read only to recognise our own merge request (findOpenMR).
+	SHA             string `json:"sha"`
+	SourceProjectID int64  `json:"source_project_id"`
+	TargetProjectID int64  `json:"target_project_id"`
 }
 
 func (m glMR) info() (model.MRInfo, error) {
@@ -143,8 +147,17 @@ type ghPR struct {
 	State   string `json:"state"`
 	Merged  bool   `json:"merged"`
 	Head    struct {
-		Ref string `json:"ref"`
+		Ref  string `json:"ref"`
+		SHA  string `json:"sha"`
+		Repo struct {
+			FullName string `json:"full_name"`
+		} `json:"repo"`
 	} `json:"head"`
+	Base struct {
+		Repo struct {
+			FullName string `json:"full_name"`
+		} `json:"repo"`
+	} `json:"base"`
 }
 
 func (p ghPR) info() (model.MRInfo, error) {
@@ -234,7 +247,15 @@ func (f *Forge) openMR(ctx context.Context, repo model.Repo, token, branch, targ
 
 // findOpenMR looks for an open merge request (GitLab) or pull request (GitHub)
 // whose source is branch. ok is false when there is none.
-func (f *Forge) findOpenMR(ctx context.Context, repo model.Repo, token, branch string) (info model.MRInfo, ok bool, err error) {
+//
+// The branch name alone does not identify our request: anyone allowed to open
+// a merge request (from a fork, say) can use the same name. One is ours only
+// if it comes from the repository itself and its head is the commit we found
+// on the branch (head).
+func (f *Forge) findOpenMR(ctx context.Context, repo model.Repo, token, branch, head string) (info model.MRInfo, ok bool, err error) {
+	if !isHexID(head) {
+		return info, false, errors.New("forge: no head commit to recognise the merge request by")
+	}
 	switch repo.Forge {
 	case "gitlab":
 		base, err := gitlabProject(repo)
@@ -247,7 +268,8 @@ func (f *Forge) findOpenMR(ctx context.Context, repo model.Repo, token, branch s
 			return info, false, err
 		}
 		for _, mr := range list {
-			if mr.SourceBranch != branch {
+			if mr.SourceBranch != branch || !strings.EqualFold(mr.SHA, head) ||
+				mr.SourceProjectID == 0 || mr.SourceProjectID != mr.TargetProjectID {
 				continue
 			}
 			if info, err = mr.info(); err != nil {
@@ -270,7 +292,8 @@ func (f *Forge) findOpenMR(ctx context.Context, repo model.Repo, token, branch s
 			return info, false, err
 		}
 		for _, pr := range list {
-			if pr.Head.Ref != branch {
+			if pr.Head.Ref != branch || !strings.EqualFold(pr.Head.SHA, head) ||
+				pr.Head.Repo.FullName == "" || !strings.EqualFold(pr.Head.Repo.FullName, pr.Base.Repo.FullName) {
 				continue
 			}
 			if info, err = pr.info(); err != nil {

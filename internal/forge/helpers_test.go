@@ -99,6 +99,27 @@ type fakeAPI struct {
 	// failPosts makes the next n requests that open a merge request fail.
 	failPosts int
 	opened    map[string]bool // source branches with an open merge request
+	// bare is the remote repository: listed requests carry the branch's commit.
+	bare string
+	// foreign makes listed requests come from another project (a fork).
+	foreign bool
+	// staleHead makes listed requests point at another commit.
+	staleHead bool
+}
+
+// head is the commit a listed merge request reports for branch.
+func (a *fakeAPI) head(branch string, stale bool) string {
+	if a.bare == "" {
+		return ""
+	}
+	if stale {
+		return strings.Repeat("0", 40)
+	}
+	out, err := exec.Command("git", "--git-dir", a.bare, "rev-parse", "refs/heads/"+branch).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func newFakeAPI(t *testing.T) *fakeAPI {
@@ -116,6 +137,7 @@ func (a *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	a.calls = append(a.calls, call)
 	fail, state, merged := a.fail, a.state, a.merged
+	foreign, stale := a.foreign, a.staleHead
 	gitlab := strings.HasPrefix(r.RequestURI, "/api/v4/")
 	path, _, _ := strings.Cut(r.RequestURI, "?")
 	opening := r.Method == http.MethodPost && (strings.HasSuffix(path, "/merge_requests") || strings.HasSuffix(path, "/pulls"))
@@ -157,7 +179,8 @@ func (a *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 		list := []map[string]any{}
 		if listed && q.Get("state") == "opened" {
 			list = append(list, map[string]any{"iid": 7, "web_url": "https://gitlab.example.com/group/app/-/merge_requests/7",
-				"state": "opened", "source_branch": q.Get("source_branch")})
+				"state": "opened", "source_branch": q.Get("source_branch"), "sha": a.head(q.Get("source_branch"), stale),
+				"source_project_id": map[bool]int{false: 42, true: 99}[foreign], "target_project_id": 42})
 		}
 		json.NewEncoder(w).Encode(list)
 	case !gitlab && r.Method == http.MethodGet && strings.HasSuffix(path, "/pulls"):
@@ -165,7 +188,9 @@ func (a *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 		list := []map[string]any{}
 		if owner, b, _ := strings.Cut(q.Get("head"), ":"); listed && owner == "owner" && q.Get("state") == "open" {
 			list = append(list, map[string]any{"number": 12, "html_url": "https://github.com/owner/app/pull/12",
-				"state": "open", "head": map[string]any{"ref": b}})
+				"state": "open", "head": map[string]any{"ref": b, "sha": a.head(b, stale),
+					"repo": map[string]any{"full_name": map[bool]string{false: "owner/app", true: "mallory/app"}[foreign]}},
+				"base": map[string]any{"repo": map[string]any{"full_name": "owner/app"}}})
 		}
 		json.NewEncoder(w).Encode(list)
 	case gitlab && r.Method == http.MethodPost && strings.HasSuffix(r.RequestURI, "/merge_requests"):
@@ -209,6 +234,7 @@ type env struct {
 func newEnv(t *testing.T, kind string, tune func(*Config)) *env {
 	t.Helper()
 	e := &env{t: t, bare: newRemote(t), api: newFakeAPI(t)}
+	e.api.bare = e.bare
 	cfg := Config{
 		AllowLocal: true,
 		TempDir:    t.TempDir(),

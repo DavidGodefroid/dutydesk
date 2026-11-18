@@ -516,7 +516,7 @@ func (f *Forge) Propose(ctx context.Context, repo model.Repo, dir, branch, title
 		if !same {
 			return none, refuse(ErrBranchExists, branch)
 		}
-		info, found, err := f.findOpenMR(ctx, repo, auth.token, branch)
+		info, found, err := f.findOpenMR(ctx, repo, auth.token, branch, existing)
 		if err != nil {
 			return none, err
 		}
